@@ -177,8 +177,7 @@ Then edit `.env`:
 
 ### 4. Build the index
 
-bROWiki (https://browiki.org) is currently offline. Once it's back up (or
-you have a self-hosted mirror/backup), point `.env` at it:
+Point `.env` at the wiki you want indexed (these are the defaults):
 
 ```
 MEDIAWIKI_API_URL=https://browiki.org/api.php
@@ -197,14 +196,17 @@ isn't indexed as a duplicate of its target), embeds it, and writes to
 pages are skipped automatically (tracked via `data/ingest_state.json`), so
 re-indexing is cheap.
 
+A full crawl of bROWiki takes roughly 12 minutes: ~1,900 articles and ~4,200
+vectors, all on CPU.
+
 Add `--force` to rebuild everything regardless of revision ids. You need
 this after changing how content is extracted, chunked or embedded —
 otherwise every page looks "unchanged" and keeps its stale vectors.
 
-**Testing against a live wiki while bROWiki is offline:** the ingestion
-script is written against the generic MediaWiki Action API (no
-site-specific assumptions), so you can point it at any public MediaWiki
-instance to validate the pipeline, e.g. the OSRS Wiki:
+**Running it against any other wiki:** the ingestion script targets the
+generic MediaWiki Action API with no site-specific assumptions, so it works
+against any MediaWiki install — Wikipedia, a self-hosted mirror, or another
+game wiki. Nothing in `.env` needs to change for a one-off run:
 
 ```bash
 python -m ingest.build_index \

@@ -9,9 +9,9 @@ Usage:
                                   --limit 25
 
 By default reads MEDIAWIKI_API_URL / WIKI_ARTICLE_BASE_URL from config/.env.
---api-url / --wiki-base-url / --limit let you point at a different (e.g.
-public stand-in) wiki without touching .env — handy for testing the pipeline
-while bROWiki is offline.
+--api-url / --wiki-base-url / --limit let you point at a different wiki
+without touching .env — handy for a quick smoke test of the pipeline against
+any public MediaWiki install.
 
 Incremental re-indexing: a small JSON state file (INGEST_STATE_PATH) records
 each page's title + revision id + the chunk ids it produced. On re-run,
