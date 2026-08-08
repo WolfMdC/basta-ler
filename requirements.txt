@@ -1,0 +1,14 @@
+# Discord bot
+discord.py>=2.3,<3.0
+
+# Embeddings (local, CPU) — multilingual model for Portuguese content
+sentence-transformers>=2.7,<3.0
+
+# Local vector store (file-based persistence, no hosted service)
+chromadb>=0.5,<0.6
+
+# HTTP client for the MediaWiki Action API
+requests>=2.31,<3.0
+
+# .env loading
+python-dotenv>=1.0,<2.0
