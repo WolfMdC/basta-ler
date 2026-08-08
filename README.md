@@ -1,6 +1,6 @@
 # browiki-bot
 
-A Discord bot for a Ragnarok Online (bROWiki) fan server. It watches one or
+A Discord bot for a Ragnarök Online LATAM Discord server. It watches one or
 more channels, figures out whether a message is a *question*, and — if it's
 confident it has a good match — replies with the relevant bROWiki page
 URL(s) and a short description. Casual chat is ignored, and low-confidence
