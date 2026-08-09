@@ -3,8 +3,10 @@
 A Discord bot for a Ragnarok Online (bROWiki) fan server. It watches one or
 more channels, figures out whether a message is a *question*, and — if it's
 confident it has a good match — replies with the relevant bROWiki page
-URL(s) and a short description. Casual chat is ignored, and low-confidence
-matches are logged instead of posted.
+URL(s) and a short description. When the question asks for a single stat
+("Quanto de pós-conjuração tem Abalo Sísmico?"), it answers with the value
+itself and links the page as the source. Casual chat is ignored, and
+low-confidence matches are logged instead of posted.
 
 Everything runs locally and for free:
 
@@ -36,6 +38,54 @@ Everything runs locally and for free:
    the bot replies with the page title, its URL, and a note that the answer
    came from the bROWiki (`bot/formatting.py`, `bot/answer.py`). Otherwise
    it stays silent and just logs what it saw.
+3. **Direct answers** (`bot/facts.py`): if the question asks for one infobox
+   field the matched page actually lists, that value leads the reply, with
+   the page link underneath it as the source.
+
+### Direct answers
+
+"Quanto de pós-conjuração tem Abalo Sísmico?" has a one-line answer, and a
+link to the page is a worse reply than the number:
+
+```
+Pós-conjuração: 0,5 segundos
+Abalo Sísmico — https://browiki.org/wiki/Abalo_Sísmico
+```
+
+Every skill and quest page opens with an infobox of label/value rows, and
+those rows are already indexed. `bot/facts.py` matches the question against
+the fields people ask for — pós-conjuração, conjuração, recarga/cooldown,
+SP, custo de AP, duração, alcance, área, níveis, alvo, tipo, propriedade,
+munição, ID — and quotes the page's own value for it, verbatim.
+
+Recovering those rows takes some care, because `ingest/chunker.py` splits on
+whitespace and leaves the infobox as one flat run of words with no delimiter
+between a label and the next:
+
+```
+Tipo Ofensiva Níveis 5 SP 30 + (Nv. da habilidade × 5) Conjuração 0 + 1 seg.
+Recarga 2 segundos Alvo Usuário Área 9x9 células …
+```
+
+So the labels themselves are the delimiters: a field's value is whatever
+sits between its label and the next known label. That works because the
+infobox is a contiguous run at the very top of the page — which is also
+where it has to *stop*, since past the last row the only "labels" left are
+words in the description. The parse therefore ends at the first value that
+reads like prose (one running into a sentence break, or cut off on a
+dangling "no"/"da"), and values are held to a per-field length and shape
+that was measured across every page in the index. Anything that fails just
+falls back to the normal link-only reply.
+
+Measured against ground truth — the same pages re-extracted from the wiki
+with labels and values still on separate lines — the parser reproduced
+**400 of 400** quotable values exactly across a 90-page random sample.
+
+Two things it deliberately doesn't do: guess at a field a page doesn't list
+(*Impacto Flamejante* has no pós-conjuração row, so that question gets the
+plain link), and read the per-level tables further down the page (asking for
+SP gives the formula the infobox shows, not the value at level 7). Set
+`DIRECT_ANSWERS=false` to turn the whole path off.
 
 ### Why rendered HTML, not wikitext
 
@@ -100,6 +150,7 @@ browiki-bot/
 │   ├── main.py          # Discord client, message handling, wiring
 │   ├── intent.py         # IntentClassifier interface + simple PT heuristic + LLM stub
 │   ├── answer.py          # AnswerWriter interface + simple summary writer + LLM stub
+│   ├── facts.py          # Infobox parsing: answers "qual o cooldown de X?" with the value
 │   ├── retriever.py      # Embeds queries, searches Chroma, re-ranks by title
 │   └── formatting.py     # Builds the Discord embed / plain-text reply
 ├── ingest/
@@ -249,9 +300,11 @@ whether it replied or stayed silent — useful for tuning
   deduplicated to one best chunk per page and re-ranked; only the top page
   is posted. The runners-up are logged so you can see what it considered.
 - **Reply shape**: page title, page URL, and a one-line note that the
-  information comes from the bROWiki — nothing else. URLs are
-  percent-encoded, without which Discord won't linkify addresses containing
-  accented characters (`.../wiki/Lâminas_Aceleradas`).
+  information comes from the bROWiki — nothing else, unless the question
+  asked for a single infobox value, which is then quoted above the link
+  (see [Direct answers](#direct-answers)). URLs are percent-encoded, without
+  which Discord won't linkify addresses containing accented characters
+  (`.../wiki/Lâminas_Aceleradas`).
 
 ## Optional: LLM-enhanced mode
 
@@ -285,6 +338,11 @@ directly, only the interface.
 - If it replies to things that aren't really questions, raise
   `QUESTION_MIN_CHARS` or tighten the interrogative list in
   `bot/intent.py`.
+- To teach direct answers a new field, add a `Field` to `FIELDS` in
+  `bot/facts.py` with the infobox label and the phrasings people type. Add
+  labels you *don't* want quoted too (with an empty `asked_as`): each one
+  recognised is a boundary that stops the row above it from swallowing the
+  next — that's why "Arma" is in the list.
 - Smaller `CHUNK_SIZE_TOKENS` gives more precise matches on short factual
   pages; larger chunks preserve more context for narrative pages (quest
   walkthroughs, lore, etc.).

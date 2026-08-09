@@ -66,6 +66,10 @@ class Config:
 
     # Reply formatting: use a Discord embed (nicer) or plain text.
     use_embed_replies: bool = field(default_factory=lambda: _env_str("USE_EMBED_REPLIES", "true").lower() in ("1", "true", "yes"))
+    # Quote the wiki's own value when a question asks for a single infobox
+    # field ("quanto de pós-conjuração...", "qual o cooldown de..."). Turn
+    # off to always reply with just the page link.
+    direct_answers: bool = field(default_factory=lambda: _env_str("DIRECT_ANSWERS", "true").lower() in ("1", "true", "yes"))
 
     # Rate limiting / debounce: minimum seconds between the bot's own
     # replies in a single channel, so a chatty channel doesn't get spammed.

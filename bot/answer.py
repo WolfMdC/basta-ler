@@ -2,9 +2,10 @@
 Answer writing: turning retrieval results into the text/description shown
 to the user, as an OPTIONAL pluggable module (mirrors bot/intent.py).
 
-  - SimpleAnswerWriter (default): no API key, no LLM call. Just reuses the
-    short page summary captured at index time (first ~300 chars of the
-    page's plain text).
+  - SimpleAnswerWriter (default): no API key, no LLM call. Reuses the short
+    page summary captured at index time (first ~300 chars of the page's
+    plain text), and — when the question asks for one — the single infobox
+    value that answers it outright (see bot/facts.py).
   - LLMAnswerWriter: stub for a future LLM-generated answer (e.g. "answer
     the user's question using this page's content as context"). Not wired
     up or required by default.
@@ -12,8 +13,10 @@ to the user, as an OPTIONAL pluggable module (mirrors bot/intent.py).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 
+from bot.facts import Fact, find_fact
 from bot.retriever import RetrievalResult
 
 
@@ -23,6 +26,10 @@ class Answer:
     url: str
     description: str
     similarity: float
+    # The wiki's own value for what was asked, when the question maps onto an
+    # infobox row the page actually has. None for everything else, which is
+    # the common case — most questions aren't a request for one number.
+    fact: Fact | None = None
 
 
 class AnswerWriter(ABC):
@@ -35,7 +42,16 @@ class AnswerWriter(ABC):
 
 class SimpleAnswerWriter(AnswerWriter):
     """Reuses the pre-computed page summary as-is — no generation, so it's
-    free and deterministic."""
+    free and deterministic.
+
+    `page_text_lookup` (title -> the page's first indexed chunk) enables the
+    direct-answer path: with it, "Quanto de pós-conjuração tem X?" is
+    answered with X's pós-conjuração instead of only a link to X. Passing
+    None turns the feature off and restores link-only replies.
+    """
+
+    def __init__(self, page_text_lookup: Callable[[str], str] | None = None):
+        self.page_text_lookup = page_text_lookup
 
     def write(self, question: str, results: list[RetrievalResult]) -> list[Answer]:
         return [
@@ -44,9 +60,15 @@ class SimpleAnswerWriter(AnswerWriter):
                 url=r.url,
                 description=r.summary or r.chunk_text[:300],
                 similarity=r.similarity,
+                fact=self._fact_for(question, r.title),
             )
             for r in results
         ]
+
+    def _fact_for(self, question: str, title: str) -> Fact | None:
+        if self.page_text_lookup is None:
+            return None
+        return find_fact(question, self.page_text_lookup(title), title)
 
 
 class LLMAnswerWriter(AnswerWriter):
@@ -75,9 +97,13 @@ class LLMAnswerWriter(AnswerWriter):
         )
 
 
-def get_answer_writer(writer_name: str, llm_api_key: str = "") -> AnswerWriter:
+def get_answer_writer(
+    writer_name: str,
+    llm_api_key: str = "",
+    page_text_lookup: Callable[[str], str] | None = None,
+) -> AnswerWriter:
     if writer_name == "simple":
-        return SimpleAnswerWriter()
+        return SimpleAnswerWriter(page_text_lookup=page_text_lookup)
     if writer_name == "llm":
         return LLMAnswerWriter(api_key=llm_api_key)
     raise ValueError(f"Unknown ANSWER_WRITER: {writer_name!r} (expected 'simple' or 'llm')")

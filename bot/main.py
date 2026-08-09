@@ -39,11 +39,17 @@ class WikiAnswerBot(discord.Client):
         self.classifier = get_intent_classifier(
             CONFIG.intent_classifier, CONFIG.question_min_chars, CONFIG.llm_api_key
         )
-        self.answer_writer = get_answer_writer(CONFIG.answer_writer, CONFIG.llm_api_key)
         self.retriever = Retriever(
             chroma_db_path=CONFIG.chroma_db_path,
             collection_name=CONFIG.chroma_collection_name,
             embedding_model=CONFIG.embedding_model,
+        )
+        # The answer writer reads a page's indexed text to quote an infobox
+        # value back; without the lookup it falls back to link-only replies.
+        self.answer_writer = get_answer_writer(
+            CONFIG.answer_writer,
+            CONFIG.llm_api_key,
+            page_text_lookup=self.retriever.page_head if CONFIG.direct_answers else None,
         )
         self._last_reply_at: dict[int, float] = {}  # channel_id -> monotonic timestamp
 
@@ -96,9 +102,11 @@ class WikiAnswerBot(discord.Client):
             return
 
         answers = self.answer_writer.write(content, confident_results)
+        fact = answers[0].fact
         logger.info(
-            "Replying with %r (score=%.3f); other candidates: %s",
+            "Replying with %r (score=%.3f) fact=%s; other candidates: %s",
             answers[0].title, confident_results[0].score,
+            f"{fact.label}={fact.value!r}" if fact else None,
             [(r.title, round(r.score, 3)) for r in confident_results[1:]],
         )
 

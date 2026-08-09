@@ -182,6 +182,33 @@ class Retriever:
             logger.info("Loaded Chroma collection %r with %d chunks", collection_name, count)
 
         self._titles = self._load_title_index()
+        self._page_heads: dict[str, str] = {}
+
+    def page_head(self, title: str) -> str:
+        """The page's first chunk — where the infobox is, if it has one.
+
+        Kept separate from `search`, because the chunk a question *matches*
+        is often not the chunk that holds the facts: a named page is matched
+        through its title card, whose document is only the page blurb.
+        Cached because a channel tends to ask about the same few pages.
+        """
+        cached = self._page_heads.get(title)
+        if cached is not None:
+            return cached
+
+        try:
+            rows = self.collection.get(
+                where={"$and": [{"title": title}, {"chunk_index": 0}]},
+                include=["documents"],
+                limit=1,
+            )
+            head = next(iter(rows.get("documents") or []), "") or ""
+        except Exception:  # pragma: no cover - defensive; never worth a crash
+            logger.exception("Could not load the first chunk of page %r", title)
+            head = ""
+
+        self._page_heads[title] = head
+        return head
 
     def _load_title_index(self) -> _TitleIndex:
         """Build the page-name index from the collection's metadata.
