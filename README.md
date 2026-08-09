@@ -1,4 +1,4 @@
-# browiki-bot
+# basta-ler-bot
 
 A Discord bot for a Ragnarök Online LATAM Discord server. It watches one or
 more channels, figures out whether a message is a *question*, and — if it's
