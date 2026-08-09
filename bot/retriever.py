@@ -13,6 +13,10 @@ happily rates any other skill page at ~0.5 against them. So the vector hits
 are re-ranked with a lexical signal on the page *title*, and any page whose
 title literally appears in the message is pulled in directly — if someone
 names a page, that page is the answer.
+
+"Literally" is tolerant of spacing everywhere, and of number for the
+character classes only, since the wiki titles those in the plural while
+players name them in the singular. See `_fold` and `_singularize`.
 """
 from __future__ import annotations
 
@@ -25,12 +29,26 @@ import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
+# The one thing the bot reads back out of a page's indexed text rather than
+# its metadata, so the format has a single definition on the ingest side.
+from ingest.html_text import parse_categories
+
 logger = logging.getLogger(__name__)
 
 # Titles shorter than this are ignored by the exact-title matcher: two- and
 # three-letter page names ("SP", "AP", "ATQ") appear inside ordinary
 # sentences all the time and would fire constantly.
 MIN_TITLE_MATCH_CHARS = 5
+
+# The singular pass needs its own, lower bar: the whole point is that the
+# typed word is shorter than the page name ("Diva" -> "Divas"). The page it
+# reaches is still held to MIN_TITLE_MATCH_CHARS.
+MIN_SINGULAR_MATCH_CHARS = 4
+
+# Category marking the pages that may be matched in the singular. See
+# `_singularize` for why it is only these. A wiki without this category
+# simply gets no singular matching.
+CLASS_CATEGORY = "Classes"
 
 # Score floor for a page whose full title was found in the message. Sits
 # above anything the vector search realistically produces, so a named page
@@ -93,14 +111,53 @@ def _fold(name: str) -> str:
       the stat page "Precisão". Measured over a 3.8k-word vocabulary drawn
       from the wiki itself, fuzzy matching fired on 35-76 everyday words,
       each of which would become a confidently wrong answer.
-    - *Plural stripping.* It matched 61 vocabulary words, and almost all of
-      them were hub pages: "habilidade" -> "Habilidades", "monstro" ->
-      "Monstros", "carta" -> "Cartas". Those are among the most common words
-      in a Ragnarok channel, so the bot answered a generic index page to
-      half the conversation. Specific pages — skills, items, cities — are
-      singular proper nouns that gain nothing from it.
+    - *Plural stripping*, applied to every page. Re-measured over a
+      19.3k-word vocabulary drawn from the wiki, it lets 120 everyday words
+      reach a title, and the worst of them are the hub pages: "niveis" ->
+      *Nível* (a word used on 1,339 pages), "habilidade" -> *Habilidades*
+      (955), "quest" -> *Quests* (426), "item" -> *Itens*, "carta" ->
+      *Cartas*, "monstro" -> *Monstros*. Those are among the most common
+      words in a Ragnarok channel, so the bot answered a generic index page
+      to half the conversation.
+
+    `_singularize` keeps the useful half of that second rule by restricting
+    it to one category of page.
     """
     return name.replace(" ", "")
+
+
+def _singularize_word(word: str) -> str:
+    """A Portuguese plural reduced to its singular, roughly."""
+    if len(word) <= 3 or not word.endswith("s"):
+        return word
+    for suffix, singular in (
+        ("oes", "ao"), ("aes", "ao"),  # "falcoes" -> "falcao" (accents already stripped)
+        ("ais", "al"), ("eis", "el"), ("ois", "ol"), ("uis", "ul"),  # "cardeais" -> "cardeal"
+        ("ns", "m"),  # "espadachins" -> "espadachim"
+        ("res", "r"), ("zes", "z"), ("ses", "s"),  # "mercadores" -> "mercador"
+    ):
+        if word.endswith(suffix):
+            return word[: -len(suffix)] + singular
+    return word[:-1]
+
+
+def _singularize(name: str) -> str:
+    """Collapse a name so singular and plural spellings compare equal.
+
+    Applied to *both* sides, so it only has to be self-consistent, not
+    linguistically right: "Magus" reduces to the non-word "magu", and a
+    message saying "Magus" reduces to the same thing.
+
+    This is deliberately not offered for every page — see `_fold` for what
+    happens when it is. It is limited to the character classes, because they
+    are the one group the wiki titles in the plural (*Mandraques*, *Divas*)
+    while players always name them in the singular: "como eu viro
+    Mandraque?" is the normal way to ask, and matching it costs nothing that
+    the hub pages cost. Which pages those are is read from the wiki's own
+    "Classes" category rather than listed here, so a class added to the wiki
+    works after the next ingest with no code change.
+    """
+    return " ".join(_singularize_word(word) for word in name.split())
 
 
 class _TitleIndex:
@@ -112,17 +169,19 @@ class _TitleIndex:
 
       1. exact — "rockridge" == "Rockridge"
       2. folded — "rock ridge" == "Rockridge"
+      3. singular — "mandraque" == "Mandraques", class pages only
 
     Without the second pass a single space is the difference between a
-    confident answer and silence.
+    confident answer and silence; without the third, so is a plural.
     """
 
     def __init__(self) -> None:
         self.by_name: dict[str, dict] = {}
         self.by_folded: dict[str, dict] = {}
+        self.by_singular: dict[str, dict] = {}
         self.max_words = 1
 
-    def add(self, normalized_title: str, page: dict) -> None:
+    def add(self, normalized_title: str, page: dict, singular_alias: bool = False) -> None:
         if normalized_title in self.by_name:
             return
         self.by_name[normalized_title] = page
@@ -130,6 +189,8 @@ class _TitleIndex:
         # setdefault: if two names fold together, the first keeps the folded
         # key and the other stays reachable through the exact lookup.
         self.by_folded.setdefault(_fold(normalized_title), page)
+        if singular_alias:
+            self.by_singular.setdefault(_fold(_singularize(normalized_title)), page)
 
     def lookup(self, query_norm: str, limit: int = 3) -> list[tuple[dict, float]]:
         """Page names present in the message, most specific first."""
@@ -152,11 +213,17 @@ class _TitleIndex:
         return [(page, score) for page, score, _ in ranked[:limit]]
 
     def _match_window(self, window: str) -> tuple[dict, float] | None:
-        if len(window) < MIN_TITLE_MATCH_CHARS:
-            return None
+        if len(window) >= MIN_TITLE_MATCH_CHARS:
+            page = self.by_name.get(window) or self.by_folded.get(_fold(window))
+            if page is not None:
+                return page, EXACT_TITLE_SCORE
 
-        page = self.by_name.get(window) or self.by_folded.get(_fold(window))
-        return (page, EXACT_TITLE_SCORE) if page is not None else None
+        if len(window) >= MIN_SINGULAR_MATCH_CHARS:
+            page = self.by_singular.get(_fold(_singularize(window)))
+            if page is not None:
+                return page, EXACT_TITLE_SCORE
+
+        return None
 
 
 class Retriever:
@@ -224,17 +291,63 @@ class Retriever:
             logger.exception("Could not load page metadata for title matching")
             return index
 
+        pages: dict[str, dict] = {}
         for meta in rows.get("metadatas") or []:
             title = meta.get("title")
-            if not title:
+            if not title or len(_normalize(title)) < MIN_TITLE_MATCH_CHARS:
                 continue
-            normalized = _normalize(title)
-            if len(normalized) < MIN_TITLE_MATCH_CHARS:
-                continue
-            index.add(normalized, {"title": title, "url": meta["url"], "summary": meta.get("summary", "")})
+            pages.setdefault(
+                title,
+                {"title": title, "url": meta["url"], "summary": meta.get("summary", "")},
+            )
 
-        logger.info("Indexed %d distinct page titles for name matching", len(index.by_name))
+        # Only titles that actually read differently in the singular are worth
+        # checking the category of — the other ~1,450 can't gain an alias.
+        plural = {
+            title for title in pages
+            if _singularize(_normalize(title)) != _normalize(title)
+        }
+        class_titles = self._class_page_titles(plural)
+
+        for title, page in pages.items():
+            index.add(_normalize(title), page, singular_alias=title in class_titles)
+
+        logger.info(
+            "Indexed %d distinct page titles for name matching (%d matchable in the singular)",
+            len(index.by_name), len(index.by_singular),
+        )
         return index
+
+    def _class_page_titles(self, titles: set[str]) -> set[str]:
+        """Which of `titles` are character-class pages.
+
+        Read from the category line the ingest appends to each page's text,
+        so the wiki stays the source of truth for what a class is. The line
+        goes on the end of the page, so it lands in whichever chunk happens
+        to be last — hence the highest `chunk_index` per title.
+        """
+        if not titles:
+            return set()
+
+        try:
+            rows = self.collection.get(
+                where={"title": {"$in": sorted(titles)}},
+                include=["documents", "metadatas"],
+            )
+        except Exception:  # pragma: no cover - defensive; older/foreign index
+            logger.exception("Could not load page categories; singular matching is off")
+            return set()
+
+        last_chunk: dict[str, tuple[int, str]] = {}
+        for meta, document in zip(rows.get("metadatas") or [], rows.get("documents") or []):
+            title, chunk_index = meta.get("title"), meta.get("chunk_index", 0)
+            if title and (title not in last_chunk or chunk_index > last_chunk[title][0]):
+                last_chunk[title] = (chunk_index, document or "")
+
+        return {
+            title for title, (_, document) in last_chunk.items()
+            if CLASS_CATEGORY in parse_categories(document)
+        }
 
     def search(self, query: str, top_k: int) -> list[RetrievalResult]:
         query_embedding = self.model.encode([query]).tolist()

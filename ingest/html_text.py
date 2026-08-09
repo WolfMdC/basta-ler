@@ -129,6 +129,35 @@ def _is_chrome(attrs) -> bool:
     return (attr.get("id") or "") in DROP_IDS
 
 
+# A page's categories are appended to its indexed text as one trailing line,
+# so they're searchable along with the body ("habilidades de monstro"). The
+# bot reads them back out of the index (see bot/retriever.py), so the two
+# sides share these helpers rather than each spelling the format out.
+CATEGORIES_PREFIX = "Categorias: "
+# Unanchored on purpose: the line survives into the index only as far as the
+# chunker, which joins everything with spaces (see ingest/chunker.py), so by
+# the time the bot reads a chunk back the prefix sits mid-text. The trailing
+# `.+` stops at the newline it still has in the un-chunked form.
+_CATEGORIES_RE = re.compile(rf"{re.escape(CATEGORIES_PREFIX)}(.+)")
+
+
+def append_categories(text: str, categories: list[str]) -> str:
+    if not categories:
+        return text
+    return f"{text}\n{CATEGORIES_PREFIX}{', '.join(categories)}"
+
+
+def parse_categories(text: str) -> list[str]:
+    """The categories from a page's indexed text, or [] if it carries none.
+
+    Categories are appended last, so the final match is the real one.
+    """
+    matches = _CATEGORIES_RE.findall(text)
+    if not matches:
+        return []
+    return [category.strip() for category in matches[-1].split(",") if category.strip()]
+
+
 @dataclass(frozen=True)
 class ExtractedPage:
     text: str  # everything, infobox and tables included — this is what we index

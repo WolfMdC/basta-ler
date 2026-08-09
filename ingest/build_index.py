@@ -36,6 +36,7 @@ from sentence_transformers import SentenceTransformer
 
 from config import CONFIG
 from ingest.chunker import chunk_text
+from ingest.html_text import append_categories
 from ingest.mediawiki_client import MediaWikiClient
 
 logging.basicConfig(
@@ -141,9 +142,7 @@ def build_index(
         if prev and prev.get("chunk_ids"):
             collection.delete(ids=prev["chunk_ids"])
 
-        page_text = content.text
-        if content.categories:
-            page_text += "\nCategorias: " + ", ".join(content.categories)
+        page_text = append_categories(content.text, content.categories)
 
         chunks = chunk_text(page_text, chunk_size, overlap)
         if not chunks:

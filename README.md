@@ -118,19 +118,38 @@ identical. So retrieval combines two signals:
   "Rock Ridge" and "rockridge" are all one name.
 
 Name matching is deliberately exact under those foldings rather than fuzzy.
-Two looser rules were measured against a 3,800-word vocabulary drawn from the
-wiki itself and rejected:
+Two looser rules were measured against a vocabulary drawn from the wiki
+itself and rejected:
 
 - *Edit distance* fired on 35–76 everyday Portuguese words — "preciso" ("I
   need") is 0.93 similar to the stat page "Precisão" — each of which becomes
   a confidently wrong answer.
-- *Plural stripping* matched 61 vocabulary words, almost all hub pages
-  ("habilidade" → *Habilidades*, "monstro" → *Monstros*). Those words are
+- *Plural stripping, applied to every page*, lets 120 everyday words reach a
+  title, and the worst of them are the hub pages: "niveis" → *Nível* (a word
+  used on 1,339 pages), "habilidade" → *Habilidades* (955), "quest" →
+  *Quests* (426), "item" → *Itens*, "carta" → *Cartas*. Those words are
   everywhere in a Ragnarok channel, so the bot answered a generic index page
   to half the conversation.
 
 The cost is that genuine typos ("rockrige") fall through to the semantic
 path and usually get silence.
+
+#### Singular names for the character classes
+
+The wiki titles every class in the plural — *Mandraques*, *Divas*,
+*Cavaleiros Rúnicos* — but nobody asks that way: "Como eu viro Mandraque?"
+is the normal phrasing, and it used to score 0.695 and get silence.
+
+So plural stripping is kept, restricted to the one group of pages it helps.
+Which pages those are is read from the wiki's own **"Classes" category**
+rather than hardcoded, so a class added to the wiki starts working after the
+next ingest. Re-measured with that restriction, the 120 everyday words that
+reach a title drop to **59, every one of them a class name** — the hub pages
+above are gone, and "quantos níveis tem essa quest?" stays silent as before.
+
+Matching runs singular-insensitively on both sides, so it only has to be
+self-consistent, not linguistically correct: *Magus* reduces to the non-word
+"magu", and so does a message saying "Magus".
 
 Matches are then held to one of two bars. A page the message actually names
 only needs `SIMILARITY_THRESHOLD`; a page matched on embedding similarity
