@@ -17,6 +17,14 @@ names a page, that page is the answer.
 "Literally" is tolerant of spacing everywhere, and of number for the
 character classes only, since the wiki titles those in the plural while
 players name them in the singular. See `_fold` and `_singularize`.
+
+A page also answers to the names the game gives it in other languages — the
+"Wild Fire / Fuego Salvaje" row the ingest lifts off each skill page — so
+"qual o cast fixo de Wild Fire?" reaches *Fogo de Supressão*. Mixing an
+English skill name into a Portuguese sentence is how people type in a LATAM
+channel, and to the matcher it is just another name for the page. Which of
+those names are safe to match on is the one judgement call: see
+MIN_ALIAS_WORDS.
 """
 from __future__ import annotations
 
@@ -29,9 +37,10 @@ import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
-# The one thing the bot reads back out of a page's indexed text rather than
-# its metadata, so the format has a single definition on the ingest side.
-from ingest.html_text import parse_categories
+# Formats written by the ingest and read back here, so each has a single
+# definition: categories ride along in the page's text, the other-language
+# names in its metadata.
+from ingest.html_text import parse_categories, parse_names
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +53,31 @@ MIN_TITLE_MATCH_CHARS = 5
 # typed word is shorter than the page name ("Diva" -> "Divas"). The page it
 # reaches is still held to MIN_TITLE_MATCH_CHARS.
 MIN_SINGULAR_MATCH_CHARS = 4
+
+# Fewest words an other-language name must have to be matched literally.
+#
+# Two-word names ("Wild Fire", "Earth Strain", "Cuchillo Danzante") are safe:
+# a two-word foreign phrase in a Portuguese sentence is a reference to the
+# skill, essentially always. One-word names are not, and the wiki has ~130 of
+# them per language. Measured against a vocabulary of the words that appear
+# lowercase in the wiki's own prose, the single-word names that are also
+# ordinary words are few but ruinous: *Faxina* is called "Remover" and
+# *Fogo Grego* "Bomba", so "como remover o encanto?" and "onde compro bomba?"
+# would both become confident wrong answers. Worst of all, *Resfriamento* is
+# called "Cooldown" — the exact word this bot wants to read as a question
+# about some *other* skill's cooldown.
+#
+# The names are still embedded in full (ingest writes a card vector for them),
+# so a one-word name can still be found by meaning; it just can't claim a page
+# outright. Lower this to 1 to match every name literally.
+#
+# Two words is not airtight, and the residual risk is Spanish rather than
+# English: 26 of the wiki's 1,692 multi-word names are built entirely out of
+# ordinary words, and 24 of those are Spanish phrases a Portuguese speaker
+# could type by accident — "Escudo Sagrado" is *Escudo Divino*, "Ataque
+# Rápido" is *Avanço Ofensivo*. They are kept because the channel is a LATAM
+# one and someone really does ask in Spanish.
+MIN_ALIAS_WORDS = 2
 
 # Category marking the pages that may be matched in the singular. See
 # `_singularize` for why it is only these. A wiki without this category
@@ -79,6 +113,8 @@ class RetrievalResult:
     similarity: float  # raw cosine similarity of the page's best chunk
     score: float  # ranking score: similarity plus the title-match bonus
     chunk_text: str
+    # The page's name in the game's other languages, straight off the wiki.
+    names: tuple[str, ...] = ()
     # True when the message actually mentions the page's name (fully or in
     # part). A match without it rests on embedding similarity alone, which
     # is far more likely to be noise — see SEMANTIC_ONLY_THRESHOLD.
@@ -192,6 +228,17 @@ class _TitleIndex:
         if singular_alias:
             self.by_singular.setdefault(_fold(_singularize(normalized_title)), page)
 
+    def add_alias(self, normalized_alias: str, page: dict) -> None:
+        """Register one of the game's other-language names for a page.
+
+        Matched exactly like a title, minus the singular pass — that rule is
+        about Portuguese plurals. A name never displaces a real page title,
+        and where two pages share a name the first one keeps it: *Rapto* and
+        *Plágio* are both "Intimidate", and a message saying "intimidate"
+        gives nothing to tell them apart.
+        """
+        self.add(normalized_alias, page)
+
     def lookup(self, query_norm: str, limit: int = 3) -> list[tuple[dict, float]]:
         """Page names present in the message, most specific first."""
         tokens = query_norm.split()
@@ -294,11 +341,16 @@ class Retriever:
         pages: dict[str, dict] = {}
         for meta in rows.get("metadatas") or []:
             title = meta.get("title")
-            if not title or len(_normalize(title)) < MIN_TITLE_MATCH_CHARS:
+            if not title:
                 continue
             pages.setdefault(
                 title,
-                {"title": title, "url": meta["url"], "summary": meta.get("summary", "")},
+                {
+                    "title": title,
+                    "url": meta["url"],
+                    "summary": meta.get("summary", ""),
+                    "names": parse_names(meta.get("names", "")),
+                },
             )
 
         # Only titles that actually read differently in the singular are worth
@@ -310,11 +362,26 @@ class Retriever:
         class_titles = self._class_page_titles(plural)
 
         for title, page in pages.items():
-            index.add(_normalize(title), page, singular_alias=title in class_titles)
+            if len(_normalize(title)) >= MIN_TITLE_MATCH_CHARS:
+                index.add(_normalize(title), page, singular_alias=title in class_titles)
+        titles_indexed = len(index.by_name)
+
+        # Second pass, after every real title is in: a page named *Vigor*
+        # must not be lost to *Determinação*, whose English name is "Vigor".
+        for page in pages.values():
+            for name in page["names"]:
+                normalized = _normalize(name)
+                if len(normalized) < MIN_TITLE_MATCH_CHARS:
+                    continue
+                if len(normalized.split()) < MIN_ALIAS_WORDS:
+                    continue
+                index.add_alias(normalized, page)
 
         logger.info(
-            "Indexed %d distinct page titles for name matching (%d matchable in the singular)",
-            len(index.by_name), len(index.by_singular),
+            "Indexed %d page names for matching: %d titles, %d from other languages "
+            "(%d titles matchable in the singular)",
+            len(index.by_name), titles_indexed, len(index.by_name) - titles_indexed,
+            len(index.by_singular),
         )
         return index
 
@@ -372,6 +439,7 @@ class Retriever:
                     similarity=similarity,
                     score=similarity,
                     chunk_text=doc,
+                    names=parse_names(meta.get("names", "")),
                 )
             )
         return out
@@ -407,6 +475,7 @@ class Retriever:
                 similarity=existing.similarity if existing else 0.0,
                 score=score,
                 chunk_text=existing.chunk_text if existing else "",
+                names=named["names"],
                 title_matched=True,
             )
 
@@ -437,5 +506,6 @@ class Retriever:
             similarity=result.similarity,
             score=min(result.similarity + bonus, 1.0),
             chunk_text=result.chunk_text,
+            names=result.names,
             title_matched=matched >= 1.0,
         )

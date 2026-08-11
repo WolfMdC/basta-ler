@@ -5,8 +5,12 @@ more channels, figures out whether a message is a *question*, and — if it's
 confident it has a good match — replies with the relevant bROWiki page
 URL(s) and a short description. When the question asks for a single stat
 ("Quanto de pós-conjuração tem Abalo Sísmico?"), it answers with the value
-itself and links the page as the source. Casual chat is ignored, and
-low-confidence matches are logged instead of posted.
+itself and links the page as the source. Questions come out of a LATAM
+channel the way people actually type them — English game terms and English
+or Spanish skill names dropped into Portuguese sentences ("qual o cast fixo
+de Wild Fire?") — so both the vocabulary and the page names are matched in
+all three languages. Casual chat is ignored, and low-confidence matches are
+logged instead of posted.
 
 Everything runs locally and for free:
 
@@ -27,9 +31,10 @@ Everything runs locally and for free:
    standard Action API (`api.php`), pulls each page as the wiki's own
    *rendered HTML*, flattens it to plain text (`ingest/html_text.py`),
    chunks it, embeds the chunks, and stores them in a local Chroma
-   collection with `title`, `url`, and `summary` metadata. Re-running it is
-   incremental — pages whose revision id hasn't changed are skipped
-   (`--force` re-does everything).
+   collection with `title`, `url`, `summary` and `names` metadata — `names`
+   being what the game calls the page in English and Spanish, lifted off the
+   row under each skill's title. Re-running it is incremental — pages whose
+   revision id hasn't changed are skipped (`--force` re-does everything).
 2. **Bot** (`bot/main.py`): listens for messages in the allowed channels. A
    Portuguese heuristic classifier (`bot/intent.py`) decides whether a
    message is a question. If so, the message is embedded and matched
@@ -57,6 +62,15 @@ those rows are already indexed. `bot/facts.py` matches the question against
 the fields people ask for — pós-conjuração, conjuração, recarga/cooldown,
 SP, custo de AP, duração, alcance, área, níveis, alvo, tipo, propriedade,
 munição, ID — and quotes the page's own value for it, verbatim.
+
+Each field answers to its English name too, because that is half of how the
+question gets typed: `cast`/`cast fixo`/`cast time` and `delay`/`aftercast`
+reach *Conjuração* and *Pós-conjuração*, `cd`/`cooldown` reaches *Recarga*,
+and `range`, `aoe`, `duration`, `target`, `element`, `ammo`, `max level`
+reach the rest. One thing it doesn't do is split a row: the wiki writes
+conjuração as `1 + 0 seg.`, so "qual o cast fixo" is answered with that
+whole cell rather than one half of it — the bot quotes the wiki, it doesn't
+do arithmetic on it.
 
 Recovering those rows takes some care, because `ingest/chunker.py` splits on
 whitespace and leaves the infobox as one flat run of words with no delimiter
@@ -114,8 +128,9 @@ identical. So retrieval combines two signals:
 - **Lexical**: candidates whose title words appear in the message get a
   ranking bonus, and any page whose full title appears in the message is
   pulled straight to the top — if someone names a page, that page is the
-  answer. Name matching ignores accents and spacing, so "rock ridge",
-  "Rock Ridge" and "rockridge" are all one name.
+  answer, in whichever of the game's languages they named it. Name matching
+  ignores accents and spacing, so "rock ridge", "Rock Ridge" and "rockridge"
+  are all one name.
 
 Name matching is deliberately exact under those foldings rather than fuzzy.
 Two looser rules were measured against a vocabulary drawn from the wiki
@@ -133,6 +148,44 @@ itself and rejected:
 
 The cost is that genuine typos ("rockrige") fall through to the semantic
 path and usually get silence.
+
+#### The English and Spanish names
+
+Nobody in a LATAM channel sticks to one language: "qual o cast fixo de Wild
+Fire?" is an ordinary sentence, and *Fogo de Supressão* is the page that
+answers it. Every skill page carries the game's other names for the skill in
+the row under its title —
+
+```
+Fogo de Supressão
+Wild Fire / Fuego Salvaje
+```
+
+— so the ingest lifts that row out (`ingest/html_text.py` recognises it by
+its markup, a small+bold cell in the leading rows of the infobox), stores it
+as `names` metadata, and gives it its own vector card next to the title
+card. The bot then treats those names as page names in their own right: same
+exact/folded matching, same score, so naming a page in English pulls it
+straight to the top exactly as naming it in Portuguese does. 1,007 of the
+wiki's ~1,900 pages have such a row.
+
+**One-word names are matched by meaning only, never literally.** The wiki
+has ~130 of them per language and, measured against the words that appear
+lowercase in its own prose, the handful that are also ordinary words are the
+ones that would hurt most: *Faxina* is called "Remover", *Fogo Grego* is
+"Bomba", and — worst of all — *Resfriamento* is called "Cooldown", the exact
+word this bot needs to read as a question about some *other* skill's
+cooldown. So "onde compro bomba?" stays silent instead of confidently
+answering *Fogo Grego*. Two-word names carry that risk far more rarely (26
+of 1,692, nearly all Spanish phrases that also read as Portuguese, e.g.
+"Escudo Sagrado" → *Escudo Divino*), and are matched. `MIN_ALIAS_WORDS` in
+`bot/retriever.py` is the dial.
+
+Reading the names also fixed a parse the bot was getting wrong: on *Aumentar
+Recuperação de SP* the "SP" in "Increase **SP** Recovery" was being read as
+the infobox's SP row, which cost that page (and *Identificar Item*, and
+*Recuperar HP em Movimento*) every direct answer it had. The name row is now
+skipped before parsing, exactly as the title always was.
 
 #### Singular names for the character classes
 
@@ -266,12 +319,26 @@ isn't indexed as a duplicate of its target), embeds it, and writes to
 pages are skipped automatically (tracked via `data/ingest_state.json`), so
 re-indexing is cheap.
 
-A full crawl of bROWiki takes roughly 12 minutes: ~1,900 articles and ~4,200
-vectors, all on CPU.
+A full crawl of bROWiki takes roughly 12 minutes: ~1,900 articles and ~5,200
+vectors (a page's chunks, plus a title card, plus a names card for the 1,007
+pages that have other-language names), all on CPU.
 
-Add `--force` to rebuild everything regardless of revision ids. You need
-this after changing how content is extracted, chunked or embedded —
-otherwise every page looks "unchanged" and keeps its stale vectors.
+The crawl is built to survive a wiki that isn't always up: HTTP 429/5xx and
+dropped connections are retried with a widening pause (2s, 4s, 8s, 16s)
+before the run gives up, and progress is written to
+`data/ingest_state.json` as it goes — a crawl that dies two-thirds through
+resumes from where it stopped instead of starting over.
+
+Each page also records the `INDEX_FORMAT` its vectors were built under, so a
+change to *how* pages are read doesn't need `--force` to take effect: bump
+`INDEX_FORMAT` in `ingest/build_index.py` after changing extraction,
+chunking, metadata or the embedding model, and the next ordinary run
+re-indexes everything (resumably). Without that stamp an unchanged page
+looks up to date and quietly keeps its stale vectors. An index built before
+the English/Spanish names is format 1, so one ordinary run brings it up to
+date; until then the bot behaves exactly as it did, matching Portuguese
+titles only. `--force` remains for re-fetching and re-embedding everything
+unconditionally.
 
 **Running it against any other wiki:** the ingestion script targets the
 generic MediaWiki Action API with no site-specific assumptions, so it works

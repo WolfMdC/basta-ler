@@ -60,15 +60,17 @@ class SimpleAnswerWriter(AnswerWriter):
                 url=r.url,
                 description=r.summary or r.chunk_text[:300],
                 similarity=r.similarity,
-                fact=self._fact_for(question, r.title),
+                fact=self._fact_for(question, r),
             )
             for r in results
         ]
 
-    def _fact_for(self, question: str, title: str) -> Fact | None:
+    def _fact_for(self, question: str, result: RetrievalResult) -> Fact | None:
         if self.page_text_lookup is None:
             return None
-        return find_fact(question, self.page_text_lookup(title), title)
+        return find_fact(
+            question, self.page_text_lookup(result.title), result.title, result.names
+        )
 
 
 class LLMAnswerWriter(AnswerWriter):

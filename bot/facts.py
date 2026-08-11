@@ -12,7 +12,11 @@ returns None and the bot falls back to its normal "here's the page" reply:
 
   1. `detect_field` — does the question actually ask for a known field?
      Matched against how people *type* it in Discord ("cooldown", "recarga",
-     "quanto de sp"), accent-insensitively.
+     "quanto de sp"), accent-insensitively. Half of that vocabulary is
+     English: a Portuguese sentence with the game's English terms dropped
+     into it ("qual o cast fixo de Fogo de Supressão?") is normal speech in
+     a Ragnarök channel, not a mistake, so both languages point at the same
+     row of the wiki's own Portuguese infobox.
   2. `parse_infobox` — recover the label/value pairs from the indexed text.
 
 The parsing is the fiddly half. `ingest/html_text.py` puts every infobox
@@ -33,6 +37,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 # Only the top of the page can hold the infobox; the rest is prose and
@@ -83,27 +88,37 @@ class Fact:
 FIELDS: tuple[Field, ...] = (
     Field(
         label="Pós-conjuração",
-        asked_as=("pos conjuracao", "after cast", "aftercast"),
+        asked_as=(
+            "pos conjuracao", "pos cast", "after cast", "aftercast",
+            "cast delay", "delay",
+        ),
         max_words=9,
     ),
     Field(
+        # The wiki writes this row as "variável + fixo" ("1 + 0 seg."), so a
+        # question about either half is answered with the whole row — the bot
+        # quotes the wiki, it doesn't do arithmetic on it.
         label="Conjuração",
-        asked_as=("tempo de conjuracao", "conjuracao", "cast time", "casting"),
+        asked_as=(
+            "tempo de conjuracao", "conjuracao", "tempo de cast", "cast time",
+            "casting time", "casting", "cast fixo", "fixed cast",
+            "cast variavel", "variable cast", "cast",
+        ),
         max_words=13,
     ),
     Field(
         label="Recarga",
-        asked_as=("tempo de recarga", "recarga", "cooldown"),
+        asked_as=("tempo de recarga", "recarga", "cooldown", "cool down", "cd"),
         max_words=10,
     ),
     Field(
         label="SP",
-        asked_as=("custo de sp", "gasto de sp", "sp"),
+        asked_as=("custo de sp", "gasto de sp", "sp cost", "sp", "mana"),
         max_words=9,
     ),
     Field(
         label="Custo de AP",
-        asked_as=("custo de ap",),
+        asked_as=("custo de ap", "ap cost", "gasto de ap"),
         max_words=7,
     ),
     Field(
@@ -118,12 +133,15 @@ FIELDS: tuple[Field, ...] = (
     ),
     Field(
         label="Área",
-        asked_as=("area de efeito", "area", "aoe"),
+        asked_as=("area de efeito", "area", "aoe", "area of effect", "splash"),
         max_words=6,
     ),
     Field(
         label="Níveis",
-        asked_as=("quantos niveis", "nivel maximo", "niveis"),
+        asked_as=(
+            "quantos niveis", "nivel maximo", "niveis", "max level",
+            "level maximo", "lv maximo",
+        ),
         max_words=3,
     ),
     Field(
@@ -134,19 +152,19 @@ FIELDS: tuple[Field, ...] = (
     ),
     Field(
         label="Tipo",
-        asked_as=("tipo",),
+        asked_as=("tipo", "type"),
         numeric=False,
         max_words=3,
     ),
     Field(
         label="Propriedade",
-        asked_as=("propriedade", "elemento"),
+        asked_as=("propriedade", "elemento", "element", "property"),
         numeric=False,
         max_words=4,
     ),
     Field(
         label="Munição",
-        asked_as=("municao", "ammo"),
+        asked_as=("municao", "ammo", "ammunition"),
         numeric=False,
         max_words=5,
     ),
@@ -290,7 +308,39 @@ def _label_at(normalized: list[str], start: int) -> tuple[Field, int] | None:
     return None
 
 
-def parse_infobox(text: str, title: str = "") -> dict[str, str]:
+def _skip_names(normalized: list[str], start: int, names: Sequence[str]) -> int:
+    """Word index just past the page's other-language names.
+
+    Same reason the title is skipped, one line further down: "Increase SP
+    Recovery / Aumentar Recuperación" opens *Aumentar Recuperação de SP*, and
+    its second word is a field label — read as one, the page's SP row becomes
+    "Recovery / Aumentar Recuperación" and the real one is never reached.
+
+    Consumes words only as long as they keep spelling out the names we were
+    given, so a page whose names sit somewhere else in the text (or aren't
+    there at all) is scanned from the title exactly as before.
+    """
+    if not names:
+        return start
+
+    expected = _normalize(" ".join(names))
+    seen = ""
+    position = start
+    while position < len(normalized):
+        word = normalized[position]
+        position += 1
+        if not word:
+            continue  # the "/" between two names, or any other punctuation
+        candidate = f"{seen} {word}".strip()
+        if not (expected == candidate or expected.startswith(f"{candidate} ")):
+            return start
+        seen = candidate
+        if seen == expected:
+            return position
+    return start
+
+
+def parse_infobox(text: str, title: str = "", names: Sequence[str] = ()) -> dict[str, str]:
     """Label -> value pairs from the infobox at the top of a page.
 
     Returns an empty dict for pages that don't open with one (hub pages,
@@ -298,12 +348,14 @@ def parse_infobox(text: str, title: str = "") -> dict[str, str]:
 
     `title` is skipped before scanning, because the page opens with its own
     name and a page can be named after a field — on "Ferir Alvo" the title's
-    second word would otherwise be read as the infobox's "Alvo" row.
+    second word would otherwise be read as the infobox's "Alvo" row. `names`
+    — the same page's name in the game's other languages — is skipped right
+    after it, for the same reason.
     """
     raw, normalized = _words(text[:MAX_SCAN_CHARS])
 
     hits: list[tuple[int, int, Field]] = []
-    position = len(title.split())
+    position = _skip_names(normalized, len(title.split()), names)
     while position < len(raw):
         match = _label_at(normalized, position)
         if match is None:
@@ -395,7 +447,9 @@ def _is_quotable(field: Field, value: str) -> bool:
     return len(words) <= 2 and words[0][:1].isupper()
 
 
-def find_fact(question: str, page_text: str, title: str = "") -> Fact | None:
+def find_fact(
+    question: str, page_text: str, title: str = "", names: Sequence[str] = ()
+) -> Fact | None:
     """The infobox value answering `question` on this page, if there is one."""
     if not page_text:
         return None
@@ -404,7 +458,7 @@ def find_fact(question: str, page_text: str, title: str = "") -> Fact | None:
     if field is None or not field.asked_as:
         return None
 
-    value = parse_infobox(page_text, title).get(field.label)
+    value = parse_infobox(page_text, title, names).get(field.label)
     if value is None or not _is_quotable(field, value):
         return None
 

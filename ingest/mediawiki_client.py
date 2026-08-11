@@ -40,6 +40,23 @@ USER_AGENT = "browiki-discord-bot/0.1 (personal hobby project; ingestion script)
 # Talk:, User:, Category:, Template:, etc.
 MAIN_NAMESPACE = 0
 
+# A full crawl is thousands of requests over several minutes, and a small
+# wiki is not up for all of them — bROWiki answers minutes at a time with a
+# Cloudflare 502, then with a 530. Nothing about those failures is specific
+# to the request that hit one, so they're waited out rather than thrown at
+# the caller.
+#
+# "Server said it's us, not you": every 5xx, which deliberately includes
+# Cloudflare's own 520-530 range for an origin it can't reach, plus 429 for
+# being asked to slow down. A 404 or a MediaWiki API error is the request's
+# own fault and asking again would fail the same way.
+MAX_ATTEMPTS = 5
+RETRY_BACKOFF_SECONDS = 2.0  # doubled after each attempt: 2, 4, 8, 16 → ~30s
+
+
+def _is_transient(status_code: int) -> bool:
+    return status_code == 429 or status_code >= 500
+
 
 @dataclass(frozen=True)
 class PageInfo:
@@ -56,6 +73,7 @@ class PageContent:
     text: str  # plain text, rendered markup flattened
     lead: str  # opening prose only, used as the page's short description
     categories: list[str]
+    names: tuple[str, ...] = ()  # the page's name in the game's other languages
 
 
 class MediaWikiClient:
@@ -68,12 +86,45 @@ class MediaWikiClient:
 
     def _get(self, params: dict) -> dict:
         params = {**params, "format": "json"}
-        resp = self._session.get(self.api_url, params=params, timeout=self.timeout)
-        resp.raise_for_status()
-        data = resp.json()
+        data = self._request(params).json()
         if "error" in data:
             raise RuntimeError(f"MediaWiki API error: {data['error']}")
         return data
+
+    def _request(self, params: dict) -> requests.Response:
+        """GET the API, waiting out the failures that are worth waiting out.
+
+        Gives up after MAX_ATTEMPTS by raising the last failure, so a wiki
+        that is genuinely down still stops the crawl instead of quietly
+        turning every page into a skip.
+        """
+        delay = RETRY_BACKOFF_SECONDS
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                response = self._session.get(self.api_url, params=params, timeout=self.timeout)
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                failure: Exception = exc
+                problem = type(exc).__name__
+            else:
+                if not _is_transient(response.status_code):
+                    response.raise_for_status()  # a 4xx: asking again won't fix it
+                    return response
+                failure = requests.HTTPError(
+                    f"{response.status_code} Server Error for url: {response.url}",
+                    response=response,
+                )
+                problem = f"HTTP {response.status_code}"
+
+            if attempt == MAX_ATTEMPTS:
+                raise failure
+            logger.warning(
+                "%s from %s (attempt %d/%d); retrying in %.0fs",
+                problem, self.api_url, attempt, MAX_ATTEMPTS, delay,
+            )
+            time.sleep(delay)
+            delay *= 2
+
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def list_all_pages(self, limit: int | None = None) -> list[PageInfo]:
         """Enumerate every main-namespace article with its latest revision id.
@@ -167,6 +218,7 @@ class MediaWikiClient:
             text=extracted.text,
             lead=extracted.lead,
             categories=categories,
+            names=extracted.names,
         )
 
     def close(self):

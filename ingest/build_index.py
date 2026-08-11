@@ -14,10 +14,14 @@ without touching .env — handy for a quick smoke test of the pipeline against
 any public MediaWiki install.
 
 Incremental re-indexing: a small JSON state file (INGEST_STATE_PATH) records
-each page's title + revision id + the chunk ids it produced. On re-run,
-pages whose revid hasn't changed are skipped entirely (no re-embedding);
-pages that changed have their old chunks deleted from Chroma and replaced;
-pages that disappeared from the wiki have their chunks removed too.
+each page's title + revision id + index format + the chunk ids it produced.
+On re-run, pages whose revid hasn't changed *and* whose vectors were built by
+the current INDEX_FORMAT are skipped entirely (no re-embedding); pages that
+changed have their old chunks deleted from Chroma and replaced; pages that
+disappeared from the wiki have their chunks removed too.
+
+That state is written as the crawl goes, not just at the end, so a crawl cut
+short by a flaky wiki resumes where it stopped instead of starting over.
 """
 from __future__ import annotations
 
@@ -36,7 +40,7 @@ from sentence_transformers import SentenceTransformer
 
 from config import CONFIG
 from ingest.chunker import chunk_text
-from ingest.html_text import append_categories
+from ingest.html_text import append_categories, format_names
 from ingest.mediawiki_client import MediaWikiClient
 
 logging.basicConfig(
@@ -44,6 +48,18 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("ingest")
+
+# What a page's vectors were built from. Bump this whenever the ingest
+# changes what it would produce for an *unchanged* page — extraction,
+# chunking, metadata, the embedding model — and the next ordinary run
+# re-indexes everything, no `--force` to remember. Version 2 added the
+# other-language names (see ingest/html_text.py).
+INDEX_FORMAT = 2
+
+# How often the crawl's progress is written to the state file. Every page
+# would mean 1,900 rewrites of the whole file; only at the end means a crawl
+# that dies at 60% has nothing to resume from.
+STATE_SAVE_EVERY = 50
 
 
 def _load_state(path: str) -> dict:
@@ -59,6 +75,19 @@ def _save_state(path: str, state: dict) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def _is_current(prev: dict | None, revid: int) -> bool:
+    """Whether a page's stored vectors are still the ones we'd produce now.
+
+    Both halves matter: the wiki hasn't touched the page *and* the vectors
+    came from this version of the ingest. Without the second half, a change
+    to how pages are read leaves every unchanged page looking up to date and
+    silently keeps its stale vectors.
+    """
+    if not prev:
+        return False
+    return prev.get("revid") == revid and prev.get("format") == INDEX_FORMAT
 
 
 def _page_url(base_url: str, title: str) -> str:
@@ -123,103 +152,122 @@ def build_index(
     pages_new = 0
     total_chunks_written = 0
 
-    for page_info in all_pages:
-        seen_titles.add(page_info.title)
-        prev = state.get(page_info.title)
-
-        if prev and prev.get("revid") == page_info.revid and not force:
-            pages_skipped += 1
-            continue
-
-        content = client.fetch_page_content(page_info.title)
-        time.sleep(client.request_delay_seconds)
-        if content is None:
-            logger.warning("Skipping %r: no content returned", page_info.title)
-            continue
-
-        # Remove any previously-indexed chunks for this page before adding
-        # the new ones (covers both "updated" and "first time" cases safely).
-        if prev and prev.get("chunk_ids"):
-            collection.delete(ids=prev["chunk_ids"])
-
-        page_text = append_categories(content.text, content.categories)
-
-        chunks = chunk_text(page_text, chunk_size, overlap)
-        if not chunks:
-            logger.info("Page %r produced no chunks (empty content), skipping", page_info.title)
-            state.pop(page_info.title, None)
-            continue
-
-        page_summary = content.lead
-        url = _page_url(wiki_base_url, page_info.title)
-
-        # A title-only "card" vector alongside the body chunks. This
-        # embedding model dilutes heavily with length: on a stat-heavy page
-        # the numbers swamp the name — "Rajada Frenética" scores 0.58 against
-        # its own title but only 0.40 against its full chunk, so questions
-        # naming a page don't retrieve it. The card keeps one clean by-name
-        # vector per page; the body chunks still answer descriptive questions
-        # ("qual habilidade acerta 3 vezes com arco").
-        chunk_ids = [f"{page_info.pageid}::title"]
-        embedding_inputs = [page_info.title]
-        documents = [page_summary or chunks[0].text]
-        chunk_indexes = [-1]
-
-        for chunk in chunks:
-            chunk_ids.append(f"{page_info.pageid}::{chunk.index}")
-            embedding_inputs.append(_embedding_text(page_info.title, chunk.text))
-            documents.append(chunk.text)
-            chunk_indexes.append(chunk.index)
-
-        embeddings = model.encode(embedding_inputs, show_progress_bar=False).tolist()
-        metadatas = [
-            {
-                "title": page_info.title,
-                "url": url,
-                "summary": page_summary,
-                "revid": page_info.revid,
-                "chunk_index": chunk_index,
-            }
-            for chunk_index in chunk_indexes
-        ]
-
-        collection.upsert(
-            ids=chunk_ids,
-            embeddings=embeddings,
-            documents=documents,
-            metadatas=metadatas,
-        )
-
-        state[page_info.title] = {
-            "pageid": page_info.pageid,
-            "revid": page_info.revid,
-            "chunk_ids": chunk_ids,
-        }
-        total_chunks_written += len(chunk_ids)
-
-        if prev:
-            pages_updated += 1
-            logger.info("Updated %r (%d chunks)", page_info.title, len(chunk_ids))
-        else:
-            pages_new += 1
-            logger.info("Indexed %r (%d chunks)", page_info.title, len(chunk_ids))
-
-    # Clean up pages that no longer exist on the wiki (only when doing a
-    # full, non-limited crawl — a --limit dev run shouldn't be treated as
-    # the full page set).
     pages_removed = 0
-    if not limit:
-        removed_titles = set(state.keys()) - seen_titles
-        for title in removed_titles:
-            chunk_ids = state[title].get("chunk_ids") or []
-            if chunk_ids:
-                collection.delete(ids=chunk_ids)
-            del state[title]
-            pages_removed += 1
-            logger.info("Removed %r (no longer on wiki)", title)
 
-    _save_state(CONFIG.ingest_state_path, state)
-    client.close()
+    # Whatever happens in here — a wiki that goes down for good, a Ctrl-C —
+    # the pages already indexed are recorded before the exception leaves.
+    try:
+        for page_info in all_pages:
+            seen_titles.add(page_info.title)
+            prev = state.get(page_info.title)
+
+            if _is_current(prev, page_info.revid) and not force:
+                pages_skipped += 1
+                continue
+
+            content = client.fetch_page_content(page_info.title)
+            time.sleep(client.request_delay_seconds)
+            if content is None:
+                logger.warning("Skipping %r: no content returned", page_info.title)
+                continue
+
+            # Remove any previously-indexed chunks for this page before adding
+            # the new ones (covers both "updated" and "first time" cases safely).
+            if prev and prev.get("chunk_ids"):
+                collection.delete(ids=prev["chunk_ids"])
+
+            page_text = append_categories(content.text, content.categories)
+
+            chunks = chunk_text(page_text, chunk_size, overlap)
+            if not chunks:
+                logger.info("Page %r produced no chunks (empty content), skipping", page_info.title)
+                state.pop(page_info.title, None)
+                continue
+
+            page_summary = content.lead
+            url = _page_url(wiki_base_url, page_info.title)
+
+            # A title-only "card" vector alongside the body chunks. This
+            # embedding model dilutes heavily with length: on a stat-heavy page
+            # the numbers swamp the name — "Rajada Frenética" scores 0.58 against
+            # its own title but only 0.40 against its full chunk, so questions
+            # naming a page don't retrieve it. The card keeps one clean by-name
+            # vector per page; the body chunks still answer descriptive questions
+            # ("qual habilidade acerta 3 vezes com arco").
+            chunk_ids = [f"{page_info.pageid}::title"]
+            embedding_inputs = [page_info.title]
+            documents = [page_summary or chunks[0].text]
+            chunk_indexes = [-1]
+
+            # Same idea for the names the game uses in other languages ("Wild
+            # Fire / Fuego Salvaje"): its own card rather than a longer title
+            # card, so asking by the English name is as clean a vector as asking
+            # by the Portuguese one, and neither dilutes the other.
+            if content.names:
+                chunk_ids.append(f"{page_info.pageid}::names")
+                embedding_inputs.append(format_names(content.names))
+                documents.append(page_summary or chunks[0].text)
+                chunk_indexes.append(-2)
+
+            for chunk in chunks:
+                chunk_ids.append(f"{page_info.pageid}::{chunk.index}")
+                embedding_inputs.append(_embedding_text(page_info.title, chunk.text))
+                documents.append(chunk.text)
+                chunk_indexes.append(chunk.index)
+
+            embeddings = model.encode(embedding_inputs, show_progress_bar=False).tolist()
+            metadatas = [
+                {
+                    "title": page_info.title,
+                    "url": url,
+                    "summary": page_summary,
+                    "names": format_names(content.names),
+                    "revid": page_info.revid,
+                    "chunk_index": chunk_index,
+                }
+                for chunk_index in chunk_indexes
+            ]
+
+            collection.upsert(
+                ids=chunk_ids,
+                embeddings=embeddings,
+                documents=documents,
+                metadatas=metadatas,
+            )
+
+            state[page_info.title] = {
+                "pageid": page_info.pageid,
+                "revid": page_info.revid,
+                "format": INDEX_FORMAT,
+                "chunk_ids": chunk_ids,
+            }
+            total_chunks_written += len(chunk_ids)
+
+            if prev:
+                pages_updated += 1
+                logger.info("Updated %r (%d chunks)", page_info.title, len(chunk_ids))
+            else:
+                pages_new += 1
+                logger.info("Indexed %r (%d chunks)", page_info.title, len(chunk_ids))
+
+            if (pages_new + pages_updated) % STATE_SAVE_EVERY == 0:
+                _save_state(CONFIG.ingest_state_path, state)
+
+        # Clean up pages that no longer exist on the wiki (only when doing a
+        # full, non-limited crawl — a --limit dev run shouldn't be treated as
+        # the full page set).
+        if not limit:
+            removed_titles = set(state.keys()) - seen_titles
+            for title in removed_titles:
+                chunk_ids = state[title].get("chunk_ids") or []
+                if chunk_ids:
+                    collection.delete(ids=chunk_ids)
+                del state[title]
+                pages_removed += 1
+                logger.info("Removed %r (no longer on wiki)", title)
+    finally:
+        _save_state(CONFIG.ingest_state_path, state)
+        client.close()
 
     logger.info(
         "Done. new=%d updated=%d unchanged=%d removed=%d chunks_written=%d collection_size=%d",
@@ -237,8 +285,11 @@ def main():
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-fetch and re-embed every page even if its revision id is unchanged "
-             "(needed after changing how content is extracted, chunked or embedded).",
+        help="Re-fetch and re-embed every page, even ones already indexed by the "
+             "current INDEX_FORMAT at their current revision id. Normally "
+             "unnecessary: bumping INDEX_FORMAT after changing how content is "
+             "extracted, chunked or embedded re-indexes everything by itself, and "
+             "an interrupted run resumes on its own.",
     )
     args = parser.parse_args()
 
