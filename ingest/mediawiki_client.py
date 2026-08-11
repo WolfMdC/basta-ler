@@ -15,12 +15,17 @@ templates and tables, which only become readable text once the wiki has
 expanded them. See ingest/html_text.py.
 
 Two calls are used per full crawl:
-  1. `list=allpages` + `prop=revisions` (via a generator) to enumerate every
-     content page along with its current revision id — cheap, paginated.
-     Redirects are filtered out so an aliased title isn't indexed as a
-     second copy of the page it points at.
+  1. `list=allpages` + `prop=revisions|redirects` (via a generator) to
+     enumerate every content page along with its current revision id and the
+     titles that redirect *to* it — cheap, paginated. Redirect pages
+     themselves are filtered out of the listing so an aliased title isn't
+     indexed as a second copy of the page it points at.
   2. `action=parse` per page (only for pages whose revision id changed since
      the last run) to fetch rendered content.
+
+The redirects are asked for because a wiki editor pointing "Sangramento" at
+`Efeitos negativos#Sangramento` is the wiki telling us, in its own words,
+that the section has a name people look it up by. See `section_names`.
 """
 from __future__ import annotations
 
@@ -30,7 +35,7 @@ from dataclasses import dataclass
 
 import requests
 
-from ingest.html_text import extract_page
+from ingest.html_text import ExtractedSection, extract_page
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +64,24 @@ def _is_transient(status_code: int) -> bool:
 
 
 @dataclass(frozen=True)
+class SectionName:
+    """A title the wiki redirects to one section of a page.
+
+    `anchor` is the redirect's `#fragment`, underscored so it compares equal
+    to the id the rendered HTML gives the heading (see ingest/html_text.py).
+    """
+
+    anchor: str
+    name: str
+
+
+@dataclass(frozen=True)
 class PageInfo:
     title: str
     pageid: int
     revid: int
+    # Titles redirecting to a section of this page, in no particular order.
+    section_names: tuple[SectionName, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,6 +93,7 @@ class PageContent:
     lead: str  # opening prose only, used as the page's short description
     categories: list[str]
     names: tuple[str, ...] = ()  # the page's name in the game's other languages
+    sections: tuple[ExtractedSection, ...] = ()  # the page cut up by heading
 
 
 class MediaWikiClient:
@@ -129,20 +149,29 @@ class MediaWikiClient:
     def list_all_pages(self, limit: int | None = None) -> list[PageInfo]:
         """Enumerate every main-namespace article with its latest revision id.
 
-        Uses `generator=allpages` combined with `prop=revisions`, which
-        returns pages + their current revid in one paginated call — no need
-        to hit `action=parse` for pages that haven't changed.
+        Uses `generator=allpages` combined with `prop=revisions|redirects`,
+        which returns pages + their current revid + the titles redirecting to
+        them in one paginated call — no need to hit `action=parse` for pages
+        that haven't changed.
 
-        `gapfilterredir=nonredirects` drops redirect pages: `action=parse`
-        follows redirects, so indexing them would store the target's content
-        a second time under the alias title (e.g. both "Laminas Aceleradas"
-        and "Lâminas Aceleradas"), which then compete in search results.
+        `gapfilterredir=nonredirects` drops redirect pages *from the listing*:
+        `action=parse` follows redirects, so indexing them would store the
+        target's content a second time under the alias title (e.g. both
+        "Laminas Aceleradas" and "Lâminas Aceleradas"), which then compete in
+        search results. They are still read here as names — the ones pointing
+        at a `#fragment` are what makes a section findable by its own name.
+
+        Continuation is handled with the API's own `continue` blob rather
+        than by tracking `gapcontinue`: asking for two properties at once
+        means the wiki can page through either of them, and a page's
+        redirects arrive across several responses when it has many.
 
         If `limit` is given, stops paginating as soon as we have at least
         that many pages (useful for quick dev/test runs against huge wikis).
         """
         pages: dict[int, PageInfo] = {}
-        gapcontinue = None
+        section_names: dict[int, set[SectionName]] = {}
+        continuation: dict[str, str] = {}
 
         while True:
             params = {
@@ -151,33 +180,54 @@ class MediaWikiClient:
                 "gapnamespace": MAIN_NAMESPACE,
                 "gapfilterredir": "nonredirects",
                 "gaplimit": "max",
-                "prop": "revisions",
+                "prop": "revisions|redirects",
                 "rvprop": "ids",
+                "rdprop": "title|fragment",
+                "rdlimit": "max",
+                **continuation,
             }
-            if gapcontinue:
-                params["gapcontinue"] = gapcontinue
 
             data = self._get(params)
             query = data.get("query", {})
             for page in query.get("pages", {}).values():
-                if "missing" in page or not page.get("revisions"):
+                if "missing" in page:
                     continue
-                revid = page["revisions"][0]["revid"]
-                pages[page["pageid"]] = PageInfo(
-                    title=page["title"], pageid=page["pageid"], revid=revid
-                )
+                pageid = page["pageid"]
+                for redirect in page.get("redirects") or []:
+                    fragment, name = redirect.get("fragment"), redirect.get("title")
+                    if fragment and name:
+                        section_names.setdefault(pageid, set()).add(
+                            SectionName(anchor=fragment.replace(" ", "_"), name=name)
+                        )
+                if page.get("revisions"):
+                    pages[pageid] = PageInfo(
+                        title=page["title"],
+                        pageid=pageid,
+                        revid=page["revisions"][0]["revid"],
+                    )
 
             if limit and len(pages) >= limit:
                 break
 
-            cont = data.get("continue", {})
-            gapcontinue = cont.get("gapcontinue")
-            if not gapcontinue:
+            continuation = data.get("continue", {})
+            if not continuation:
                 break
             time.sleep(self.request_delay_seconds)
 
-        logger.info("Discovered %d pages via allpages", len(pages))
-        return list(pages.values())
+        listed = [
+            PageInfo(
+                title=page.title,
+                pageid=page.pageid,
+                revid=page.revid,
+                section_names=tuple(sorted(section_names.get(page.pageid, ()), key=str)),
+            )
+            for page in pages.values()
+        ]
+        logger.info(
+            "Discovered %d pages via allpages (%d of them with named sections)",
+            len(listed), sum(1 for page in listed if page.section_names),
+        )
+        return listed
 
     def fetch_page_content(self, title: str) -> PageContent | None:
         """Fetch a page's rendered HTML and reduce it to plain text."""
@@ -219,6 +269,7 @@ class MediaWikiClient:
             lead=extracted.lead,
             categories=categories,
             names=extracted.names,
+            sections=extracted.sections,
         )
 
     def close(self):

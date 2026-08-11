@@ -18,6 +18,12 @@ One row of that infobox is pulled out separately: the line under the page
 title that names the skill in the game's other languages ("Wild Fire /
 Fuego Salvaje"). Players use those names in Portuguese sentences all the
 time, so they are kept as page names in their own right — see `page_names`.
+
+The page is also cut up along its headings (`sections`), because on this
+wiki a heading is often the real subject: *Sangramento* is not a page, it is
+a section of *Efeitos negativos*, and the useful answer is that section and
+the `#Sangramento` anchor that reaches it — not the page as a whole. Each
+section keeps the anchor MediaWiki gave it, so the two can be linked.
 """
 from __future__ import annotations
 
@@ -49,6 +55,12 @@ BLOCK_TAGS = {
     "blockquote", "section", "pre",
 }
 CELL_TAGS = {"td", "th"}
+HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+
+# Where MediaWiki puts a section's anchor. Older skins wrap the heading text
+# in `<span class="mw-headline" id="Sangramento">`; newer ones put the id on
+# the `<h2>` itself. Both are read, so this works across wiki versions.
+HEADLINE_CLASS = "mw-headline"
 
 # The other-language name row carries no label, so it is recognised by the
 # markup the wiki gives it: a cell whose entire content is small *and* bold.
@@ -63,14 +75,32 @@ _CELL_MARK = "\x00"
 _EDIT_LINK_RE = re.compile(r"\[\s*editar[^\]]*\]", re.IGNORECASE)
 
 
-class _TextExtractor(HTMLParser):
-    """Flattens rendered wiki HTML to text, keeping two things on the side.
+@dataclass
+class _RawHeading:
+    """A heading found in the HTML, and where its text sits in `parts`.
 
-    `paragraphs` collects the prose outside tables (the page blurb), and
+    Positions rather than text, because a section's *body* is everything the
+    flattener emitted between this heading and the next one of the same rank
+    — which is only knowable once the whole document has been read.
+    """
+
+    level: int  # 2 for <h2>, 3 for <h3>, …
+    anchor: str  # the id MediaWiki gave it, i.e. the page's #fragment
+    text: list[str]
+    start: int  # index in `parts` where the heading opened
+    end: int = 0  # index in `parts` where it closed, i.e. where the body starts
+
+
+class _TextExtractor(HTMLParser):
+    """Flattens rendered wiki HTML to text, keeping three things on the side.
+
+    `paragraphs` collects the prose outside tables (the page blurb),
     `name_rows` the small-and-bold cells that open the first table — the
-    other-language names on a skill page. Both are things the flattened text
-    can no longer be asked for: once the page is one run of lines, a name row
-    is indistinguishable from any other short line.
+    other-language names on a skill page — and `headings` the section
+    headings with their anchors. All three are things the flattened text can
+    no longer be asked for: once the page is one run of lines, a name row is
+    indistinguishable from any other short line, and a heading from any other
+    short line that happens to sit above one.
     """
 
     def __init__(self) -> None:
@@ -80,6 +110,9 @@ class _TextExtractor(HTMLParser):
         self.paragraphs: list[str] = []
         # Candidate other-language name rows, in document order.
         self.name_rows: list[str] = []
+        # Section headings, in document order.
+        self.headings: list[_RawHeading] = []
+        self._heading: _RawHeading | None = None
         self._depth = 0
         # Depth of the element whose subtree we're currently skipping, if any.
         self._skip_from: int | None = None
@@ -118,6 +151,17 @@ class _TextExtractor(HTMLParser):
             self._small_depth += 1
         elif tag in BOLD_TAGS:
             self._bold_depth += 1
+
+        if tag in HEADING_TAGS:
+            self._heading = _RawHeading(
+                level=int(tag[1]),
+                anchor=dict(attrs).get("id") or "",
+                text=[],
+                start=len(self.parts),
+            )
+        elif self._heading is not None and not self._heading.anchor:
+            if HEADLINE_CLASS in _classes(attrs):
+                self._heading.anchor = dict(attrs).get("id") or ""
 
         if tag in CELL_TAGS:
             self._cell = []
@@ -162,6 +206,13 @@ class _TextExtractor(HTMLParser):
         if tag in CELL_TAGS:
             self._close_cell()
 
+        if tag in HEADING_TAGS and self._heading is not None:
+            # `end` is recorded before the block newline below, so a section's
+            # body starts on that newline — an empty line the cleanup drops.
+            self._heading.end = len(self.parts)
+            self.headings.append(self._heading)
+            self._heading = None
+
         if tag in BLOCK_TAGS:
             self.parts.append("\n")
 
@@ -169,6 +220,8 @@ class _TextExtractor(HTMLParser):
         if self._skip_from is not None:
             return
         self.parts.append(data)
+        if self._heading is not None:
+            self._heading.text.append(data)
         if self._paragraph is not None:
             self._paragraph.append(data)
         if self._cell is not None:
@@ -192,11 +245,14 @@ class _TextExtractor(HTMLParser):
             self.name_rows.append(cell)
 
 
+def _classes(attrs) -> set[str]:
+    return set((dict(attrs).get("class") or "").split())
+
+
 def _is_chrome(attrs) -> bool:
     """True for wiki UI furniture (edit links, TOC, navboxes, …)."""
     attr = dict(attrs)
-    classes = set((attr.get("class") or "").split())
-    if classes & DROP_CLASSES:
+    if _classes(attrs) & DROP_CLASSES:
         return True
     return (attr.get("id") or "") in DROP_IDS
 
@@ -268,10 +324,19 @@ def parse_names(value: str) -> tuple[str, ...]:
 
 
 @dataclass(frozen=True)
+class ExtractedSection:
+    anchor: str  # the page's #fragment for this section, e.g. "Sangramento"
+    heading: str  # the heading as the wiki shows it
+    text: str  # the heading plus everything under it, flattened like the page
+    lead: str  # a short blurb, for the same use the page's `lead` has
+
+
+@dataclass(frozen=True)
 class ExtractedPage:
     text: str  # everything, infobox and tables included — this is what we index
     lead: str  # opening prose only — a human-readable blurb for the page
     names: tuple[str, ...] = ()  # the page's name in the game's other languages
+    sections: tuple[ExtractedSection, ...] = ()  # one per heading, in page order
 
 
 def extract_page(html: str, lead_max_chars: int = 300) -> ExtractedPage:
@@ -279,8 +344,22 @@ def extract_page(html: str, lead_max_chars: int = 300) -> ExtractedPage:
     parser.feed(html)
     parser.close()
 
+    # Only the first candidate row: a page names itself once, and a second
+    # small+bold cell before the first field is something else.
+    names = page_names(parser.name_rows[0]) if parser.name_rows else ()
+
+    return ExtractedPage(
+        text="\n".join(_flatten(parser.parts)),
+        lead=_build_lead(parser.paragraphs, lead_max_chars),
+        names=names,
+        sections=_build_sections(parser, lead_max_chars),
+    )
+
+
+def _flatten(parts: list[str]) -> list[str]:
+    """The extractor's emitted fragments as clean lines of text."""
     lines: list[str] = []
-    for raw_line in "".join(parser.parts).split("\n"):
+    for raw_line in "".join(parts).split("\n"):
         cells = [re.sub(r"\s+", " ", cell).strip() for cell in raw_line.split(_CELL_MARK)]
         cells = [cell for cell in cells if cell]
         if not cells:
@@ -288,16 +367,48 @@ def extract_page(html: str, lead_max_chars: int = 300) -> ExtractedPage:
         line = _EDIT_LINK_RE.sub("", " | ".join(cells)).strip(" |").strip()
         if line:
             lines.append(line)
+    return lines
 
-    # Only the first candidate row: a page names itself once, and a second
-    # small+bold cell before the first field is something else.
-    names = page_names(parser.name_rows[0]) if parser.name_rows else ()
 
-    return ExtractedPage(
-        text="\n".join(lines),
-        lead=_build_lead(parser.paragraphs, lead_max_chars),
-        names=names,
-    )
+def _build_sections(parser: _TextExtractor, lead_max_chars: int) -> tuple[ExtractedSection, ...]:
+    """Cut the flattened page into one piece per heading.
+
+    A section runs from its heading to the next heading of the same rank or
+    higher, so an `<h2>` keeps the `<h3>` subsections nested under it — the
+    same extent MediaWiki itself gives a section, and the one a reader
+    following the anchor sees.
+    """
+    sections: list[ExtractedSection] = []
+    for position, heading in enumerate(parser.headings):
+        end = len(parser.parts)
+        for following in parser.headings[position + 1:]:
+            if following.level <= heading.level:
+                end = following.start
+                break
+
+        title = re.sub(r"\s+", " ", "".join(heading.text)).strip()
+        body = _flatten(parser.parts[heading.end:end])
+        if not title or not body:
+            continue  # a decorative heading, or one with nothing under it
+
+        text = "\n".join([title, *body])
+        sections.append(
+            ExtractedSection(
+                # Spaces are underscores in a URL fragment, and the heading
+                # text is the anchor MediaWiki derives when nothing else says.
+                anchor=(heading.anchor or title).replace(" ", "_"),
+                heading=title,
+                text=text,
+                lead=_truncate(" ".join(body), lead_max_chars),
+            )
+        )
+    return tuple(sections)
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rsplit(" ", 1)[0] + "…"
 
 
 def _build_lead(paragraphs: list[str], max_chars: int) -> str:
@@ -316,7 +427,4 @@ def _build_lead(paragraphs: list[str], max_chars: int) -> str:
         if sum(len(p) + 1 for p in collected) >= 120:
             break
 
-    blurb = " ".join(collected).strip()
-    if len(blurb) <= max_chars:
-        return blurb
-    return blurb[:max_chars].rsplit(" ", 1)[0] + "…"
+    return _truncate(" ".join(collected).strip(), max_chars)

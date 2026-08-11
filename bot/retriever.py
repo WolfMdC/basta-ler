@@ -25,6 +25,15 @@ English skill name into a Portuguese sentence is how people type in a LATAM
 channel, and to the matcher it is just another name for the page. Which of
 those names are safe to match on is the one judgement call: see
 MIN_ALIAS_WORDS.
+
+Some answers aren't pages at all. *Sangramento* is a section of *Efeitos
+negativos*, and the ingest indexes it as a unit of its own (see
+`ingest/build_index.py`), anchor included. Here those sections are matched by
+name exactly as pages are, but one rank below them (SECTION_MATCH_SCORE) and
+never under a name the infobox uses for a row: "qual o alcance de Bola de
+Fogo?" is a question about the skill, not about the stat page's *Alcance*
+section. What that leaves is MIN_SECTION_NAME_WORDS, the second judgement
+call.
 """
 from __future__ import annotations
 
@@ -36,6 +45,8 @@ from dataclasses import dataclass
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
+
+from bot.facts import is_field_label
 
 # Formats written by the ingest and read back here, so each has a single
 # definition: categories ride along in the page's text, the other-language
@@ -79,6 +90,24 @@ MIN_SINGULAR_MATCH_CHARS = 4
 # one and someone really does ask in Spanish.
 MIN_ALIAS_WORDS = 2
 
+# Fewest words a section's name must have to be matched literally. One, on
+# purpose — see `_load_title_index`. The reason it is a dial rather than a
+# constant is that one-word section names are the one place this bot answers
+# to ordinary Portuguese words: the wiki points "Sorte", "Força", "Vento" and
+# "Visual" at sections of its stat and item pages, so "kkkkk mano que sorte a
+# sua" now reaches *Atributos § Sorte* where it used to reach nothing. Of the
+# 134 one-word section names on this wiki, ~15 read that way; the rest are
+# game jargon ("Sangramento", "Petrificação", "Hipotermia") that no one types
+# by accident. Raise this to 2 to keep only the multi-word names ("Sono
+# Profundo", "Velocidade de Ataque") and give up the single words entirely.
+#
+# Nothing measurable separates the two groups: mid-sentence, the wiki's own
+# prose capitalises "Sorte" 76% of the time and "Sangramento" 79%, and a
+# casual "que sorte a sua" scores no lower against the *Sorte* section than
+# "como curar congelamento?" does against *Congelamento*. The choice is
+# recall against quiet, not a threshold waiting to be tuned.
+MIN_SECTION_NAME_WORDS = 1
+
 # Category marking the pages that may be matched in the singular. See
 # `_singularize` for why it is only these. A wiki without this category
 # simply gets no singular matching.
@@ -88,6 +117,13 @@ CLASS_CATEGORY = "Classes"
 # above anything the vector search realistically produces, so a named page
 # always wins.
 EXACT_TITLE_SCORE = 0.90
+
+# The same, for a *section* named in the message. Deliberately lower, so that
+# a real page always outranks a section of some other page when the message
+# names both. The wiki's section names are the ordinary words of the game —
+# "Alcance", "Conjuração", "Sorte" are all sections of stat pages — and in
+# "qual o alcance de Bola de Fogo?" the subject is the skill, not the stat.
+SECTION_MATCH_SCORE = 0.85
 
 # Maximum bonus for a partial title match (e.g. message mentions "rajada"
 # and the page is "Rajada Certeira"), scaled by the fraction matched.
@@ -108,17 +144,31 @@ _STOPWORDS = {
 @dataclass(frozen=True)
 class RetrievalResult:
     title: str
-    url: str
+    url: str  # the section's #anchor included, when this is a section
     summary: str
     similarity: float  # raw cosine similarity of the page's best chunk
     score: float  # ranking score: similarity plus the title-match bonus
     chunk_text: str
     # The page's name in the game's other languages, straight off the wiki.
+    # On a section, the titles the wiki redirects to it.
     names: tuple[str, ...] = ()
     # True when the message actually mentions the page's name (fully or in
     # part). A match without it rests on embedding similarity alone, which
     # is far more likely to be noise — see SEMANTIC_ONLY_THRESHOLD.
     title_matched: bool = False
+    # The heading, when the match is one named section of a page rather than
+    # the page itself. Empty for a page.
+    section: str = ""
+
+    @property
+    def name(self) -> str:
+        """What this match is called — the subject of the answer.
+
+        A section is named by its heading, but the heading alone ("Coma",
+        "Sorte") reads as an odd thing to be told, so the page it belongs to
+        is kept alongside it.
+        """
+        return f"{self.title} § {self.section}" if self.section else self.title
 
 
 def _normalize(text: str) -> str:
@@ -196,6 +246,30 @@ def _singularize(name: str) -> str:
     return " ".join(_singularize_word(word) for word in name.split())
 
 
+def _where(*clauses: dict) -> dict:
+    """A Chroma filter from one or more clauses ($and needs at least two)."""
+    return clauses[0] if len(clauses) == 1 else {"$and": list(clauses)}
+
+
+def _name_score(page: dict) -> float:
+    return SECTION_MATCH_SCORE if page["section"] else EXACT_TITLE_SCORE
+
+
+def _is_matchable_section_name(name: str) -> bool:
+    """Whether a section may be claimed by this name when a message uses it.
+
+    Held to the same bars a page title is, plus one of its own: a name an
+    infobox uses for a row is how questions ask about *other* pages, so it
+    can't be a name here. See MIN_SECTION_NAME_WORDS for the rest.
+    """
+    normalized = _normalize(name)
+    return (
+        len(normalized) >= MIN_TITLE_MATCH_CHARS
+        and len(normalized.split()) >= MIN_SECTION_NAME_WORDS
+        and not is_field_label(name)
+    )
+
+
 class _TitleIndex:
     """Finds page names inside a message, tolerating how people type them.
 
@@ -242,7 +316,7 @@ class _TitleIndex:
     def lookup(self, query_norm: str, limit: int = 3) -> list[tuple[dict, float]]:
         """Page names present in the message, most specific first."""
         tokens = query_norm.split()
-        found: dict[str, tuple[dict, float, int]] = {}
+        found: dict[tuple[str, str], tuple[dict, float, int]] = {}
 
         for size in range(1, self.max_words + 1):
             for start in range(len(tokens) - size + 1):
@@ -251,10 +325,11 @@ class _TitleIndex:
                 if match is None:
                     continue
                 page, score = match
-                previous = found.get(page["title"])
+                key = (page["title"], page["section"])
+                previous = found.get(key)
                 # Prefer the longer window: "rajada frenetica" beats "rajada".
                 if previous is None or (score, len(window)) > (previous[1], previous[2]):
-                    found[page["title"]] = (page, score, len(window))
+                    found[key] = (page, score, len(window))
 
         ranked = sorted(found.values(), key=lambda item: (item[1], item[2]), reverse=True)
         return [(page, score) for page, score, _ in ranked[:limit]]
@@ -263,12 +338,12 @@ class _TitleIndex:
         if len(window) >= MIN_TITLE_MATCH_CHARS:
             page = self.by_name.get(window) or self.by_folded.get(_fold(window))
             if page is not None:
-                return page, EXACT_TITLE_SCORE
+                return page, _name_score(page)
 
         if len(window) >= MIN_SINGULAR_MATCH_CHARS:
             page = self.by_singular.get(_fold(_singularize(window)))
             if page is not None:
-                return page, EXACT_TITLE_SCORE
+                return page, _name_score(page)
 
         return None
 
@@ -295,6 +370,12 @@ class Retriever:
         else:
             logger.info("Loaded Chroma collection %r with %d chunks", collection_name, count)
 
+        # Clauses restricting a query to a page's own rows, empty on an index
+        # that holds no sections — a wiki that names none, or an index built
+        # before they were read. Chroma matches nothing against a field its
+        # rows don't have, so filtering unconditionally would quietly turn
+        # off every feature below that reads a page's text.
+        self._page_only: tuple[dict, ...] = ()
         self._titles = self._load_title_index()
         self._page_heads: dict[str, str] = {}
 
@@ -305,6 +386,10 @@ class Retriever:
         is often not the chunk that holds the facts: a named page is matched
         through its title card, whose document is only the page blurb.
         Cached because a channel tends to ask about the same few pages.
+
+        Only the page's own chunks, never a section's: `section` is the field
+        that tells them apart in the index (see `ingest/build_index.py`), and
+        an infobox belongs to the page.
         """
         cached = self._page_heads.get(title)
         if cached is not None:
@@ -312,7 +397,7 @@ class Retriever:
 
         try:
             rows = self.collection.get(
-                where={"$and": [{"title": title}, {"chunk_index": 0}]},
+                where=_where({"title": title}, *self._page_only, {"chunk_index": 0}),
                 include=["documents"],
                 limit=1,
             )
@@ -325,11 +410,11 @@ class Retriever:
         return head
 
     def _load_title_index(self) -> _TitleIndex:
-        """Build the page-name index from the collection's metadata.
+        """Build the name index from the collection's metadata.
 
-        Small enough to hold in memory (one entry per page, not per chunk)
-        and lets us answer "is this page named in the message?" without a
-        vector search.
+        Small enough to hold in memory (one entry per page and per named
+        section, not per chunk) and lets us answer "is this named in the
+        message?" without a vector search.
         """
         index = _TitleIndex()
         try:
@@ -339,19 +424,25 @@ class Retriever:
             return index
 
         pages: dict[str, dict] = {}
+        sections: dict[tuple[str, str], dict] = {}
         for meta in rows.get("metadatas") or []:
             title = meta.get("title")
             if not title:
                 continue
-            pages.setdefault(
-                title,
-                {
-                    "title": title,
-                    "url": meta["url"],
-                    "summary": meta.get("summary", ""),
-                    "names": parse_names(meta.get("names", "")),
-                },
-            )
+            entry = {
+                "title": title,
+                "url": meta["url"],
+                "summary": meta.get("summary", ""),
+                "names": parse_names(meta.get("names", "")),
+                "section": meta.get("section", ""),
+            }
+            if entry["section"]:
+                sections.setdefault((title, entry["section"]), entry)
+            else:
+                pages.setdefault(title, entry)
+
+        if sections:
+            self._page_only = ({"section": ""},)
 
         # Only titles that actually read differently in the singular are worth
         # checking the category of — the other ~1,450 can't gain an alias.
@@ -376,11 +467,24 @@ class Retriever:
                 if len(normalized.split()) < MIN_ALIAS_WORDS:
                     continue
                 index.add_alias(normalized, page)
+        aliases_indexed = len(index.by_name) - titles_indexed
+
+        # Sections last, so a name shared with a real page always resolves to
+        # the page. One-word names are kept, unlike MIN_ALIAS_WORDS: the
+        # game's one-word English names are accidents of translation, while a
+        # one-word section name is the whole point — "Sangramento",
+        # "Cegueira", "Congelamento" are what these things *are* called, and
+        # an editor chose to point them at that heading.
+        for section in sections.values():
+            for name in (section["section"], *section["names"]):
+                if _is_matchable_section_name(name):
+                    index.add_alias(_normalize(name), section)
 
         logger.info(
-            "Indexed %d page names for matching: %d titles, %d from other languages "
-            "(%d titles matchable in the singular)",
-            len(index.by_name), titles_indexed, len(index.by_name) - titles_indexed,
+            "Indexed %d names for matching: %d page titles, %d from other languages, "
+            "%d for %d named sections (%d titles matchable in the singular)",
+            len(index.by_name), titles_indexed, aliases_indexed,
+            len(index.by_name) - titles_indexed - aliases_indexed, len(sections),
             len(index.by_singular),
         )
         return index
@@ -391,14 +495,15 @@ class Retriever:
         Read from the category line the ingest appends to each page's text,
         so the wiki stays the source of truth for what a class is. The line
         goes on the end of the page, so it lands in whichever chunk happens
-        to be last — hence the highest `chunk_index` per title.
+        to be last — hence the highest `chunk_index` per title, among the
+        page's own chunks (a section's chunks don't carry the line).
         """
         if not titles:
             return set()
 
         try:
             rows = self.collection.get(
-                where={"title": {"$in": sorted(titles)}},
+                where=_where({"title": {"$in": sorted(titles)}}, *self._page_only),
                 include=["documents", "metadatas"],
             )
         except Exception:  # pragma: no cover - defensive; older/foreign index
@@ -440,16 +545,22 @@ class Retriever:
                     score=similarity,
                     chunk_text=doc,
                     names=parse_names(meta.get("names", "")),
+                    section=meta.get("section", ""),
                 )
             )
         return out
 
     def best_unique_pages(self, query: str, top_k: int) -> list[RetrievalResult]:
-        """Best matching *pages* for a message, ranked by hybrid score.
+        """Best matching *subjects* for a message, ranked by hybrid score.
 
         Collapses several chunks of the same page down to its best-scoring
         one, re-ranks the vector hits with the title-match bonus, and merges
         in any page explicitly named in the message.
+
+        A named section counts as a subject of its own, so *Efeitos
+        negativos* and its *Sangramento* section are two candidates rather
+        than one — otherwise the page would swallow the very anchor that
+        makes it a useful answer.
         """
         query_norm = _normalize(query)
         query_tokens = _content_tokens(query_norm)
@@ -458,17 +569,18 @@ class Retriever:
         # the same page, and the re-ranking needs candidates to work with.
         raw = self.search(query, top_k=max(top_k * 8, 24))
 
-        best_per_page: dict[str, RetrievalResult] = {}
+        best_per_page: dict[tuple[str, str], RetrievalResult] = {}
         for result in raw:
             scored = self._apply_title_bonus(result, query_norm, query_tokens)
-            existing = best_per_page.get(scored.title)
+            existing = best_per_page.get((scored.title, scored.section))
             if existing is None or scored.score > existing.score:
-                best_per_page[scored.title] = scored
+                best_per_page[(scored.title, scored.section)] = scored
 
         for named, name_score in self._titles.lookup(query_norm):
-            existing = best_per_page.get(named["title"])
+            key = (named["title"], named["section"])
+            existing = best_per_page.get(key)
             score = max(name_score, existing.score if existing else 0.0)
-            best_per_page[named["title"]] = RetrievalResult(
+            best_per_page[key] = RetrievalResult(
                 title=named["title"],
                 url=named["url"],
                 summary=named["summary"] or (existing.summary if existing else ""),
@@ -477,6 +589,7 @@ class Retriever:
                 chunk_text=existing.chunk_text if existing else "",
                 names=named["names"],
                 title_matched=True,
+                section=named["section"],
             )
 
         ranked = sorted(best_per_page.values(), key=lambda r: r.score, reverse=True)
@@ -485,7 +598,12 @@ class Retriever:
     def _apply_title_bonus(
         self, result: RetrievalResult, query_norm: str, query_tokens: set[str]
     ) -> RetrievalResult:
-        title_tokens = _content_tokens(_normalize(result.title))
+        if result.section and not _is_matchable_section_name(result.section):
+            return result  # a name this bot doesn't answer to; see above
+
+        # A section is named by its heading; the page's title is the heading
+        # this one happens to live under and says nothing about the subject.
+        title_tokens = _content_tokens(_normalize(result.section or result.title))
         if not title_tokens:
             return result
 
@@ -508,4 +626,5 @@ class Retriever:
             chunk_text=result.chunk_text,
             names=result.names,
             title_matched=matched >= 1.0,
+            section=result.section,
         )

@@ -31,10 +31,12 @@ Everything runs locally and for free:
    standard Action API (`api.php`), pulls each page as the wiki's own
    *rendered HTML*, flattens it to plain text (`ingest/html_text.py`),
    chunks it, embeds the chunks, and stores them in a local Chroma
-   collection with `title`, `url`, `summary` and `names` metadata — `names`
-   being what the game calls the page in English and Spanish, lifted off the
-   row under each skill's title. Re-running it is incremental — pages whose
-   revision id hasn't changed are skipped (`--force` re-does everything).
+   collection with `title`, `url`, `summary`, `names` and `section` metadata
+   — `names` being what the game calls the page in English and Spanish,
+   lifted off the row under each skill's title, and `section` marking the
+   rows that belong to one named section of a page rather than the page
+   itself. Re-running it is incremental — pages whose revision id and
+   redirects haven't changed are skipped (`--force` re-does everything).
 2. **Bot** (`bot/main.py`): listens for messages in the allowed channels. A
    Portuguese heuristic classifier (`bot/intent.py`) decides whether a
    message is a question. If so, the message is embedded and matched
@@ -203,6 +205,63 @@ above are gone, and "quantos níveis tem essa quest?" stays silent as before.
 Matching runs singular-insensitively on both sides, so it only has to be
 self-consistent, not linguistically correct: *Magus* reduces to the non-word
 "magu", and so does a message saying "Magus".
+
+#### Pages whose real subject is a heading
+
+*Sangramento* is not a page on this wiki. It is one of the 29 sections of
+*Efeitos negativos*, so "alguém sabe o que faz o sangramento?" got silence,
+and the best the bot could have done was link the page as a whole — which
+opens on *Alucinação* and says nothing about bleeding until you scroll. The
+answer people want is the section, and the anchor that opens the page on it:
+
+```
+Efeitos negativos § Sangramento
+https://browiki.org/wiki/Efeitos_negativos#Sangramento
+```
+
+So the ingest cuts every page along its headings and indexes the named ones
+as subjects in their own right — own summary, own vectors, own URL with the
+`#anchor` on it — while the page keeps its own chunks exactly as before.
+
+**Which sections count is read off the wiki, not guessed at.** A heading on
+its own is no evidence of anything: "Notas" is a heading on 1,161 of this
+wiki's pages and names nothing. A *redirect* pointing at one is — the editor
+who made `Sangramento` an alias for `Efeitos negativos#Sangramento` is
+saying, in the wiki's own data, that readers look that section up by name,
+and what they call it. This wiki has 276 such redirects, covering 138
+sections of 33 pages, and they carry the abbreviations and alternate
+spellings too (`ASPD`, `Velocidade de ataque` → *Atributos § Velocidade de
+Ataque*). Redirects are re-read on every crawl, and pointing a new one at a
+page re-indexes it — the page's own revision id says nothing about pages
+pointing *at* it.
+
+A section is matched by name exactly as a page is, with two restrictions:
+
+- It ranks one step below a real page (`SECTION_MATCH_SCORE` 0.85 against
+  `EXACT_TITLE_SCORE` 0.90), so when a message names both, the page wins:
+  "qual o alcance de Bola de Fogo?" is a question about the skill.
+- **A name an infobox uses for a row is not a name.** *Alcance*,
+  *Conjuração*, *Propriedade* and *Munição* are all sections of stat pages
+  *and* labels in every skill infobox, which makes them the words people use
+  to ask about some *other* page — the same trap "Cooldown" sets above.
+  `bot/facts.py` already knows the labels, so the list maintains itself.
+
+What's left is one-word section names, and they are the judgement call this
+time. Unlike the game's one-word English names, they can't simply be dropped:
+one word is what a status effect *is* called. But the wiki also points
+"Sorte", "Força", "Vento" and "Visual" at sections of its stat and item
+pages, so "kkkkk mano que sorte a sua" now reaches *Atributos § Sorte* where
+it used to reach nothing. Of the 134 one-word section names here, ~15 read
+that way; the rest are jargon ("Petrificação", "Hipotermia", "Cristalização")
+nobody types by accident.
+
+Nothing measurable separates the two groups — mid-sentence, the wiki's prose
+capitalises "Sorte" 76% of the time and "Sangramento" 79%, and a casual "que
+sorte a sua" scores no *lower* against the *Sorte* section than "como curar
+congelamento?" does against *Congelamento*. It is recall against quiet, not
+a threshold waiting to be tuned. `MIN_SECTION_NAME_WORDS` in
+`bot/retriever.py` is the dial: raise it to 2 to keep only the multi-word
+names (*Sono Profundo*, *Envenenamento Mortal*) and give up the rest.
 
 Matches are then held to one of two bars. A page the message actually names
 only needs `SIMILARITY_THRESHOLD`; a page matched on embedding similarity

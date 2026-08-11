@@ -22,8 +22,10 @@ from bot.retriever import RetrievalResult
 
 @dataclass(frozen=True)
 class Answer:
+    # What the answer is about: a page title, or "Page § Section" when the
+    # match is one named section of a page (see RetrievalResult.name).
     title: str
-    url: str
+    url: str  # the section's #anchor included, when the match is a section
     description: str
     similarity: float
     # The wiki's own value for what was asked, when the question maps onto an
@@ -56,7 +58,7 @@ class SimpleAnswerWriter(AnswerWriter):
     def write(self, question: str, results: list[RetrievalResult]) -> list[Answer]:
         return [
             Answer(
-                title=r.title,
+                title=r.name,
                 url=r.url,
                 description=r.summary or r.chunk_text[:300],
                 similarity=r.similarity,
@@ -67,6 +69,12 @@ class SimpleAnswerWriter(AnswerWriter):
 
     def _fact_for(self, question: str, result: RetrievalResult) -> Fact | None:
         if self.page_text_lookup is None:
+            return None
+        if result.section:
+            # A section has no infobox of its own, and the one at the top of
+            # the page it sits in belongs to the page: quoting *Efeitos
+            # negativos*' rows as the duration of Sangramento would be
+            # answering a question nobody asked.
             return None
         return find_fact(
             question, self.page_text_lookup(result.title), result.title, result.names

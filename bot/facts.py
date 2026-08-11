@@ -90,7 +90,7 @@ FIELDS: tuple[Field, ...] = (
         label="Pós-conjuração",
         asked_as=(
             "pos conjuracao", "pos cast", "after cast", "aftercast",
-            "cast delay", "delay",
+            "cast delay", "delay", "pos", "gcd", "cast",
         ),
         max_words=9,
     ),
@@ -102,7 +102,7 @@ FIELDS: tuple[Field, ...] = (
         asked_as=(
             "tempo de conjuracao", "conjuracao", "tempo de cast", "cast time",
             "casting time", "casting", "cast fixo", "fixed cast",
-            "cast variavel", "variable cast", "cast",
+            "cast variavel", "variable cast", "cast", "vct",
         ),
         max_words=13,
     ),
@@ -256,6 +256,17 @@ def _build_question_lookup() -> list[tuple[str, Field]]:
 
 _LABELS = _build_label_lookup()
 _QUESTION_PHRASES = _build_question_lookup()
+
+
+def is_field_label(name: str) -> bool:
+    """Whether `name` is what an infobox calls one of its rows.
+
+    Asked by `bot/retriever.py` about the names it is offered: a word the
+    wiki uses as a label ("Alcance", "Propriedade", "Munição") is a word
+    questions use to ask about *some other page*, so it must not become the
+    name of a page of its own.
+    """
+    return _normalize(name) in _LABELS
 
 
 def detect_field(question: str) -> Field | None:
