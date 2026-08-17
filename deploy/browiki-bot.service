@@ -1,0 +1,52 @@
+# systemd unit for the Discord bot.
+#
+# Install to /etc/systemd/system/browiki-bot.service, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now browiki-bot
+#
+# Paths assume the repo lives at /home/ubuntu/browiki-bot with its venv in
+# .venv/ — adjust User/WorkingDirectory/ExecStart together if yours differs.
+
+[Unit]
+Description=basta-ler-bot (bROWiki Discord bot)
+Documentation=https://github.com/WolfMdC/basta-ler
+# The bot opens a WebSocket to Discord on startup, so wait for real
+# connectivity rather than just for the network stack to exist.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/browiki-bot
+
+# config.py calls load_dotenv() with no path, so it reads ./.env relative to
+# WorkingDirectory above — no EnvironmentFile needed. Keep that file at
+# chmod 600; it holds DISCORD_BOT_TOKEN.
+ExecStart=/home/ubuntu/browiki-bot/.venv/bin/python -m bot.main
+
+# Without this, Python block-buffers stdout when it isn't a tty and the
+# journal stays empty for minutes at a time.
+Environment=PYTHONUNBUFFERED=1
+# Where sentence-transformers caches the downloaded embedding model (~470 MB
+# on first start). Pinned explicitly so it doesn't land somewhere surprising.
+Environment=HF_HOME=/home/ubuntu/.cache/huggingface
+
+# Discord drops the gateway connection routinely; the process should come
+# straight back rather than leave the bot offline until someone notices.
+Restart=always
+RestartSec=10s
+# discord.py shuts the gateway down cleanly on SIGINT (it treats it as
+# KeyboardInterrupt); a bare SIGTERM kills it mid-connection instead.
+KillSignal=SIGINT
+TimeoutStopSec=30s
+
+# Modest hardening. ProtectHome is deliberately off — both the repo and the
+# model cache live under /home/ubuntu.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

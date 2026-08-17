@@ -1,0 +1,23 @@
+# Oneshot reindex job, driven by browiki-bot-reindex.timer.
+#
+# Install alongside the timer in /etc/systemd/system/, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now browiki-bot-reindex.timer
+#
+# Run it by hand any time with:
+#   sudo systemctl start browiki-bot-reindex.service
+
+[Unit]
+Description=Rebuild the bROWiki Chroma index
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as root so it can stop/start browiki-bot.service; the script drops to
+# the bot user before writing anything under data/.
+ExecStart=/home/ubuntu/browiki-bot/deploy/reindex.sh
+# A full bROWiki crawl is ~12 minutes on CPU. Give it room for a bad day on
+# the wiki's end (the crawler backs off and retries on 429/5xx) without
+# letting a wedged run hang around forever.
+TimeoutStartSec=2h

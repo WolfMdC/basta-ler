@@ -1,0 +1,7 @@
+# The deploy files are consumed by Linux (systemd, bash). A CRLF here is not
+# cosmetic: `#!/usr/bin/env bash^M` fails with "bad interpreter", and systemd
+# rejects unit lines with a trailing CR. Pin them to LF regardless of anyone's
+# core.autocrlf setting.
+*.sh text eol=lf
+*.service text eol=lf
+*.timer text eol=lf

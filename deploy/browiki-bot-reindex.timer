@@ -1,0 +1,17 @@
+# Weekly wiki reindex. Pairs with browiki-bot-reindex.service.
+
+[Unit]
+Description=Weekly bROWiki index refresh
+
+[Timer]
+# Sunday 04:00 in the VM's timezone — check it with `timedatectl`, since
+# Oracle images default to UTC. Pick an hour the Discord server is quiet:
+# the bot is offline while the crawl runs (~12 minutes).
+OnCalendar=Sun *-*-* 04:00:00
+# Spread the start over 30 minutes so the wiki doesn't see a clockwork hit.
+RandomizedDelaySec=30m
+# If the VM was down at 04:00, run once it's back rather than skipping the week.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -292,6 +292,11 @@ browiki-bot/
 ├── data/
 │   ├── chroma/            # Chroma's persisted vector DB (gitignored)
 │   └── ingest_state.json  # Tracks each page's last-indexed revision id (gitignored)
+├── deploy/
+│   ├── browiki-bot.service          # systemd unit: keeps the bot running/restarting
+│   ├── browiki-bot-reindex.service  # systemd unit: oneshot wiki reindex
+│   ├── browiki-bot-reindex.timer    # Weekly schedule for the reindex
+│   └── reindex.sh                   # Stop bot -> crawl -> start bot
 ├── config.py              # Central config, reads from .env
 ├── requirements.txt
 ├── .env.example
@@ -426,6 +431,152 @@ The bot logs every message it sees in a watched channel, whether it was
 classified as a question, what it matched (title + similarity score), and
 whether it replied or stayed silent — useful for tuning
 `SIMILARITY_THRESHOLD` and `QUESTION_MIN_CHARS`.
+
+## Deployment: keeping the bot online
+
+`python -m bot.main` holds an open WebSocket to Discord's gateway and blocks
+forever, so the bot is online for exactly as long as that process is. Closing
+the terminal, logging out, or letting the machine sleep takes it offline —
+there's no daemon left behind. Nor can it live on static hosting like GitHub
+Pages: there's no process there to keep a connection open, and the bot token
+has to stay secret.
+
+What it needs is a machine that's always on, plus something to restart the
+process after a crash or a reboot. The setup below is an Oracle Cloud Always
+Free VM with systemd, but only the first section is Oracle-specific — the
+units in `deploy/` work on any Ubuntu box, including a Raspberry Pi.
+
+### 1. Create the instance
+
+Pick the **Ampere ARM** shape (`VM.Standard.A1.Flex`), not the AMD
+`VM.Standard.E2.1.Micro`. The micro instance is also Always Free, but it has
+1 GB of RAM and this bot loads PyTorch plus a 470 MB embedding model into
+memory — it will be OOM-killed. The ARM shape's free allowance is 4 OCPU and
+24 GB of RAM; **2 OCPU / 12 GB** is comfortable and leaves room to run a
+second instance later.
+
+Use the **Ubuntu 24.04** image (its system Python is 3.12), and save the SSH
+key pair when prompted. You do *not* need to touch the security list or open
+any ports: the bot only makes outbound connections to Discord and the wiki,
+and nothing connects in.
+
+> Oracle's free ARM capacity is genuinely scarce in some regions — a launch
+> can fail with `Out of host capacity`. It's not a problem with your account;
+> retrying over a few hours, or from the Always Free-eligible region you
+> picked at signup, usually gets one.
+
+### 2. Install system dependencies
+
+SSH in as `ubuntu`, then:
+
+```bash
+sudo apt update
+sudo apt install -y git python3-venv python3-dev build-essential
+```
+
+`build-essential` and `python3-dev` are there for the same reason Windows
+needs the MSVC build tools: `chroma-hnswlib` has no prebuilt wheel for
+`aarch64` either, so pip compiles it from source.
+
+### 3. Clone, install, configure
+
+```bash
+git clone https://github.com/WolfMdC/basta-ler.git ~/browiki-bot
+cd ~/browiki-bot
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+On ARM this pulls the right PyTorch automatically — there are no CUDA builds
+for `aarch64`, so the default PyPI wheel is already CPU-only. (If you ever
+deploy this to an x86 host instead, install torch from
+`--index-url https://download.pytorch.org/whl/cpu` first, or pip will drag in
+2 GB of CUDA libraries the bot never uses.)
+
+`.env` is gitignored, so copy yours up from your local machine rather than
+recreating it by hand — then lock it down, since it holds the bot token:
+
+```bash
+# from your local machine
+scp .env ubuntu@<instance-public-ip>:~/browiki-bot/.env
+# back on the instance
+chmod 600 ~/browiki-bot/.env
+```
+
+### 4. Build the index
+
+`data/chroma/` is gitignored too, so the clone has no index and the bot
+would match nothing. Build it on the instance:
+
+```bash
+cd ~/browiki-bot && .venv/bin/python -m ingest.build_index
+```
+
+That's the same ~12 minute crawl described above. Run it inside `tmux` (or
+`screen`) so a dropped SSH session doesn't kill it — though if one does, the
+crawl is resumable and re-running picks up where it stopped. Alternatively,
+`rsync -a data/ ubuntu@<ip>:~/browiki-bot/data/` copies the index you already
+built locally and skips the crawl entirely.
+
+### 5. Install the systemd units
+
+```bash
+chmod +x ~/browiki-bot/deploy/reindex.sh
+sudo cp ~/browiki-bot/deploy/*.service ~/browiki-bot/deploy/*.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now browiki-bot.service
+sudo systemctl enable --now browiki-bot-reindex.timer
+```
+
+`enable --now` both starts the bot and makes it come up on boot.
+`browiki-bot.service` sets `Restart=always`, so a crash or a dropped gateway
+connection brings the process straight back instead of leaving the bot
+silently offline. First start is slower than usual — sentence-transformers
+downloads the embedding model before the bot connects.
+
+The paths in all three unit files assume the repo is at
+`/home/ubuntu/browiki-bot` with its venv in `.venv/`. If yours differs, edit
+`User`, `WorkingDirectory` and `ExecStart` together, plus `BOT_USER`/`APP_DIR`
+at the top of `deploy/reindex.sh`.
+
+### 6. Watch it run
+
+The bot's logging — every message seen, how it was classified, what it
+matched and whether it replied — goes to the journal:
+
+```bash
+sudo journalctl -u browiki-bot -f          # follow live
+sudo journalctl -u browiki-bot --since today
+systemctl status browiki-bot
+```
+
+| Task | Command |
+|---|---|
+| Restart after editing `.env` | `sudo systemctl restart browiki-bot` |
+| Stop the bot | `sudo systemctl stop browiki-bot` |
+| Deploy new code | `cd ~/browiki-bot && git pull && sudo systemctl restart browiki-bot` |
+| Reindex now | `sudo systemctl start browiki-bot-reindex.service` |
+| When's the next reindex? | `systemctl list-timers browiki-bot-reindex` |
+| Reindex logs | `sudo journalctl -u browiki-bot-reindex` |
+
+### The weekly reindex
+
+`browiki-bot-reindex.timer` runs `deploy/reindex.sh` every Sunday at 04:00 to
+pick up new and edited wiki pages. Oracle images default to UTC, so check
+`timedatectl` and adjust `OnCalendar` to an hour your Discord server is
+actually quiet.
+
+The script stops the bot, crawls, and starts it again — roughly 12 minutes
+offline. That's deliberate rather than lazy: Chroma persists to a SQLite file
+plus its own HNSW segments and doesn't support two processes on one path, and
+a running bot serves the index it loaded at startup anyway, so it wouldn't
+see new pages without a restart regardless. The restart is in an `EXIT` trap,
+so a crawl that fails partway still brings the bot back.
+
+If you'd rather have no downtime at all, skip the timer
+(`sudo systemctl disable --now browiki-bot-reindex.timer`) and reindex by
+hand when it suits you. Remember that `INDEX_FORMAT` bumps only take effect
+on the next run, so a schedule is the easy way not to forget.
 
 ## Behavior details
 
